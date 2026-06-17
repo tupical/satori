@@ -1,0 +1,29 @@
+# Prompt: research — answer a free-form query, optionally informed by tasks
+#
+# Variants:
+#   default       — `query` only, no task context
+#   with_context  — `query` + a `tasks_block` listing relevant tasks
+#
+# Variables:
+#   query        — user's research question (free-form)
+#   tasks_block  — pre-formatted "title + description" list (only used by
+#                  with_context); empty when no tasks were supplied
+
+[meta]
+name = "research"
+description = "Answer a free-form research query, optionally grounded in the bodies of one or more existing tasks."
+
+[variants.default]
+template = """You are a project-management assistant. Answer the research query below. Reply in 3-6 sentences, plain text, no headings or bullet points. If you do not know the answer, say so honestly.
+
+Query:
+{ query }"""
+
+[variants.with_context]
+template = """You are a project-management assistant. Answer the research query below using only the surrounding task context as the source of truth. Reply in 3-6 sentences, plain text. If the context is insufficient, say so explicitly and propose one concrete follow-up question.
+
+Query:
+{ query }
+
+Task context:
+{ tasks_block }"""
