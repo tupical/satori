@@ -32,6 +32,8 @@ use taskagent_domain::agent::Actor;
 use taskagent_shared::{time, TaskId, Timestamp};
 use uuid::Uuid;
 
+use intake_oss::raw_item::{RawItem, RawItemKind};
+
 // ── Strongly-typed ID for sensemaking items ────────────────────────────────
 
 /// Opaque UUIDv7 identifier for a [`SensingItem`].
@@ -244,6 +246,43 @@ impl SensingItem {
         self.source = Some(s);
         self
     }
+
+    /// Construct a [`SensingItem`] from a [`RawItem`] (Intake layer),
+    /// recording lineage via a [`SensingLink`] with kind [`LinkKind::DerivedFrom`].
+    ///
+    /// # Kind mapping
+    ///
+    /// | [`RawItemKind`]  | [`SensingItemKind`] |
+    /// |------------------|---------------------|
+    /// | `Text`           | `Knowledge`         |
+    /// | `Document`       | `Knowledge`         |
+    /// | `Reference`      | `ResearchGap`       |
+    /// | `Event`          | `Insight`           |
+    /// | `Binary`         | `Knowledge`         |
+    ///
+    /// Returns both the new item and its provenance link so the caller can
+    /// persist them together without losing the origin.
+    pub fn from_raw_item(raw: &RawItem) -> (Self, SensingLink) {
+        let kind = match raw.kind {
+            RawItemKind::Reference => SensingItemKind::ResearchGap,
+            RawItemKind::Event => SensingItemKind::Insight,
+            _ => SensingItemKind::Knowledge,
+        };
+
+        let item = Self::new(kind, raw.body.clone()).with_source(Source::External {
+            ref_: raw.source.clone(),
+        });
+
+        let link = SensingLink::new(
+            item.id,
+            SensingTarget::RawItem {
+                id: raw.id.to_string(),
+            },
+            LinkKind::DerivedFrom,
+        );
+
+        (item, link)
+    }
 }
 
 // ── RejectedIdea ─────────────────────────────────────────────────────────
@@ -455,5 +494,59 @@ mod tests {
         assert!(s.starts_with("si_"), "got: {s}");
         let back: SensingItemId = s.parse().unwrap();
         assert_eq!(id, back);
+    }
+
+    // ── from_raw_item adapter ─────────────────────────────────────────────────
+
+    #[test]
+    fn from_raw_item_records_provenance() {
+        use intake_oss::raw_item::{NewRawItem, RawItemKind};
+
+        let raw = NewRawItem::new("user://alice", RawItemKind::Text, "важная заметка").build();
+        let raw_id_str = raw.id.to_string();
+
+        let (item, link) = SensingItem::from_raw_item(&raw);
+
+        // Родословная: link.source == item.id, link.target == RawItem с тем же id
+        assert_eq!(link.source, item.id);
+        assert_eq!(
+            link.target,
+            SensingTarget::RawItem { id: raw_id_str.clone() },
+            "провенанс должен ссылаться на исходный RawItem"
+        );
+        assert_eq!(link.kind, LinkKind::DerivedFrom);
+
+        // Содержимое передалось
+        assert_eq!(item.body, "важная заметка");
+        assert_eq!(item.kind, SensingItemKind::Knowledge);
+
+        // Из SensingLink можно восстановить id исходного RawItem
+        let recovered_id = match &link.target {
+            SensingTarget::RawItem { id } => id.clone(),
+            other => panic!("ожидался RawItem, получено: {other:?}"),
+        };
+        assert_eq!(recovered_id, raw_id_str);
+    }
+
+    #[test]
+    fn from_raw_item_kind_mapping() {
+        use intake_oss::raw_item::{NewRawItem, RawItemKind};
+
+        let cases = [
+            (RawItemKind::Text, SensingItemKind::Knowledge),
+            (RawItemKind::Document, SensingItemKind::Knowledge),
+            (RawItemKind::Binary, SensingItemKind::Knowledge),
+            (RawItemKind::Reference, SensingItemKind::ResearchGap),
+            (RawItemKind::Event, SensingItemKind::Insight),
+        ];
+
+        for (raw_kind, expected_kind) in cases {
+            let raw = NewRawItem::new("src://test", raw_kind, "body").build();
+            let (item, _link) = SensingItem::from_raw_item(&raw);
+            assert_eq!(
+                item.kind, expected_kind,
+                "RawItemKind::{raw_kind:?} → ожидалось {expected_kind:?}"
+            );
+        }
     }
 }

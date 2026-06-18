@@ -17,6 +17,10 @@ taskagent-shared   = { path = "vendor/oss/crates/shared" }
 taskagent-domain   = { path = "vendor/oss/crates/domain" }
 taskagent-core     = { path = "vendor/oss/crates/core" }
 
+# Intake layer — read-only, used only for RawItem type import and
+# the from_raw_item adapter that records provenance lineage.
+intake-oss = { path = "../intake_oss" }
+
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio      = { version = "1.52", features = ["macros", "rt-multi-thread"] }
@@ -27,3 +31,19 @@ uuid         = { version = "1.10", features = ["v7", "serde"] }
 
 [dev-dependencies]
 taskagent-ai-infra = { path = "vendor/oss/crates/ai-infra", features = ["testing"] }
+
+# Deduplicate vendored crates: intake_oss references the same taskagent OSS
+# tree through its own vendor/oss symlink, producing different path strings
+# that Cargo treats as distinct packages. [patch] keys must be file:// URIs,
+# not relative paths (Cargo 1.96+). Pattern mirrors decisions_oss/Cargo.toml.
+[patch."file:///home/av/projects/intake_oss/vendor/oss/crates/ai-infra"]
+taskagent-ai-infra = { path = "vendor/oss/crates/ai-infra" }
+
+[patch."file:///home/av/projects/intake_oss/vendor/oss/crates/shared"]
+taskagent-shared = { path = "vendor/oss/crates/shared" }
+
+[patch."file:///home/av/projects/intake_oss/vendor/oss/crates/domain"]
+taskagent-domain = { path = "vendor/oss/crates/domain" }
+
+[patch."file:///home/av/projects/intake_oss/vendor/oss/crates/core"]
+taskagent-core = { path = "vendor/oss/crates/core" }
