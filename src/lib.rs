@@ -22,6 +22,7 @@
 
 pub mod prompts;
 pub mod research;
+pub mod types;
 
 // ── Re-export the infrastructure layer ─────────────────────────────────────────
 //
@@ -36,3 +37,10 @@ pub use prompts::PromptRegistry;
 // ── Operation re-exports ────────────────────────────────────────────────────────
 
 pub use research::{build_research_prompt, format_task_context, research};
+
+// ── Sensemaking type re-exports ────────────────────────────────────────────────
+
+pub use types::{
+    Confidence, LinkKind, ReconsiderTrigger, RejectedIdea, RejectedIdeaId, SensingItem,
+    SensingItemId, SensingItemKind, SensingLink, SensingTarget, Source,
+};
