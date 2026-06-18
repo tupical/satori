@@ -36,7 +36,7 @@ pub use prompts::PromptRegistry;
 
 // ── Operation re-exports ────────────────────────────────────────────────────────
 
-pub use research::{build_research_prompt, format_task_context, research};
+pub use research::{annotate_research_output, build_research_prompt, format_task_context, research};
 
 // ── Sensemaking type re-exports ────────────────────────────────────────────────
 

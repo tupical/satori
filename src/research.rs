@@ -17,6 +17,7 @@ use taskagent_shared::CoreError;
 use taskagent_ai_infra::{provider::AiProvider, untrusted::wrap_untrusted};
 
 use crate::prompts::PromptRegistry;
+use crate::types::{Confidence, SensingItem, SensingItemKind, Source};
 
 /// Format a task list into a single block suitable for inclusion in
 /// the research prompt. Tasks are numbered; descriptions (when
@@ -64,6 +65,70 @@ pub fn build_research_prompt(query: &str, context: &[Task]) -> String {
         )
         .expect("bundled research prompt is well-formed")
     }
+}
+
+/// Heuristically classify lines of a research answer into [`SensingItem`]s.
+///
+/// This is a **best-effort** annotator, not a parser: it scans each
+/// non-empty line for leading markers that signal the kind of sensemaking
+/// unit, then wraps the rest of the line as the item body.  Lines that
+/// carry no recognised marker are emitted as `Knowledge` items (the safest
+/// default for plain factual statements).
+///
+/// Recognised prefixes (case-insensitive):
+///
+/// | Prefix | Kind |
+/// |---|---|
+/// | `?` / `q:` | `Question` |
+/// | `hypothesis:` / `h:` | `Hypothesis` |
+/// | `risk:` / `r:` | `Risk` |
+/// | `contradiction:` / `!` | `Contradiction` |
+/// | `insight:` / `i:` | `Insight` |
+/// | `gap:` / `research_gap:` | `ResearchGap` |
+/// | `rejected:` / `rejected_idea:` | `RejectedIdea` (body only; no full provenance) |
+/// | anything else | `Knowledge` |
+///
+/// The `label` is forwarded as [`Source::AiResearch`] on every item.
+pub fn annotate_research_output(text: &str, label: Option<String>) -> Vec<SensingItem> {
+    let source_proto = label.clone();
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let (kind, body) = classify_line(line);
+            SensingItem::new(kind, body)
+                .with_source(Source::AiResearch {
+                    label: source_proto.clone(),
+                })
+                // Research output is treated as medium-low confidence by
+                // default — the caller can adjust per item.
+                .with_confidence(Confidence::new(0.4))
+        })
+        .collect()
+}
+
+fn classify_line(line: &str) -> (SensingItemKind, &str) {
+    // Try each prefix in order; return on first match.
+    let prefixes: &[(&[&str], SensingItemKind)] = &[
+        (&["?", "q:"], SensingItemKind::Question),
+        (&["hypothesis:", "h:"], SensingItemKind::Hypothesis),
+        (&["risk:", "r:"], SensingItemKind::Risk),
+        (&["contradiction:", "!"], SensingItemKind::Contradiction),
+        (&["insight:", "i:"], SensingItemKind::Insight),
+        (&["gap:", "research_gap:"], SensingItemKind::ResearchGap),
+        (&["rejected:", "rejected_idea:"], SensingItemKind::RejectedIdea),
+    ];
+
+    let lower = line.to_ascii_lowercase();
+    for (markers, kind) in prefixes {
+        for marker in *markers {
+            if lower.starts_with(marker) {
+                let body = line[marker.len()..].trim();
+                return (*kind, body);
+            }
+        }
+    }
+    (SensingItemKind::Knowledge, line)
 }
 
 /// Run a research query through the provider and return the answer as
@@ -149,5 +214,33 @@ mod tests {
         let captured = provider.captured_prompts.lock().unwrap();
         assert!(captured[0].contains("explain"));
         assert!(captured[0].contains("ctx"));
+    }
+
+    #[test]
+    fn annotate_classifies_prefixed_lines() {
+        use crate::types::SensingItemKind;
+        let text = "\
+The sky is blue
+? Why is the sky blue?
+hypothesis: light scatters at short wavelengths
+risk: sensor overheating at noon
+contradiction: two sensors disagree on temperature
+insight: peak readings cluster at 14:00
+gap: no data for winter months
+rejected: use infrared only — visible light also needed";
+
+        let items = annotate_research_output(text, Some("test-run".into()));
+        assert_eq!(items.len(), 8);
+        assert_eq!(items[0].kind, SensingItemKind::Knowledge);
+        assert_eq!(items[1].kind, SensingItemKind::Question);
+        assert_eq!(items[2].kind, SensingItemKind::Hypothesis);
+        assert_eq!(items[3].kind, SensingItemKind::Risk);
+        assert_eq!(items[4].kind, SensingItemKind::Contradiction);
+        assert_eq!(items[5].kind, SensingItemKind::Insight);
+        assert_eq!(items[6].kind, SensingItemKind::ResearchGap);
+        assert_eq!(items[7].kind, SensingItemKind::RejectedIdea);
+        // Prefixes are stripped from bodies.
+        assert_eq!(items[1].body, "Why is the sky blue?");
+        assert_eq!(items[2].body, "light scatters at short wavelengths");
     }
 }
