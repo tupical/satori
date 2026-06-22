@@ -28,11 +28,33 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use taskagent_domain::agent::Actor;
-use taskagent_shared::{time, TaskId, Timestamp};
 use uuid::Uuid;
 
-use intake_oss::raw_item::{RawItem, RawItemKind};
+use crate::time::{self, Timestamp};
+
+// ── Local actor ────────────────────────────────────────────────────────────
+
+/// Opaque actor reference — who performed an action.
+///
+/// Kept as a plain string so this crate has no dependency on taskagent's
+/// domain. mcpbox maps to/from taskagent's `Actor` when wiring the layer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Actor {
+    /// Opaque identifier (user-id, agent-id, service name, …).
+    pub id: String,
+}
+
+impl Actor {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+
+    /// Convenience: anonymous user actor for tests and defaults.
+    #[cfg(test)]
+    pub fn user() -> Self {
+        Self::new("user")
+    }
+}
 
 // ── Strongly-typed ID for sensemaking items ────────────────────────────────
 
@@ -167,11 +189,13 @@ impl Default for Confidence {
 ///
 /// Intentionally open: a plain string covers non-software contexts (a
 /// journal article, a meeting transcript, a physical experiment result).
+/// Task references use an opaque string ID so this crate has no compile-time
+/// dependency on taskagent. mcpbox maps to/from typed IDs when wiring.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
-    /// A task in the taskagent tracker.
-    Task { id: TaskId },
+    /// A task in the taskagent tracker (opaque string ID).
+    Task { id: String },
     /// A free-form reference (URL, citation, file path, …).
     External { ref_: String },
     /// Produced by an AI research operation with an optional run label.
@@ -245,43 +269,6 @@ impl SensingItem {
     pub fn with_source(mut self, s: Source) -> Self {
         self.source = Some(s);
         self
-    }
-
-    /// Construct a [`SensingItem`] from a [`RawItem`] (Intake layer),
-    /// recording lineage via a [`SensingLink`] with kind [`LinkKind::DerivedFrom`].
-    ///
-    /// # Kind mapping
-    ///
-    /// | [`RawItemKind`]  | [`SensingItemKind`] |
-    /// |------------------|---------------------|
-    /// | `Text`           | `Knowledge`         |
-    /// | `Document`       | `Knowledge`         |
-    /// | `Reference`      | `ResearchGap`       |
-    /// | `Event`          | `Insight`           |
-    /// | `Binary`         | `Knowledge`         |
-    ///
-    /// Returns both the new item and its provenance link so the caller can
-    /// persist them together without losing the origin.
-    pub fn from_raw_item(raw: &RawItem) -> (Self, SensingLink) {
-        let kind = match raw.kind {
-            RawItemKind::Reference => SensingItemKind::ResearchGap,
-            RawItemKind::Event => SensingItemKind::Insight,
-            _ => SensingItemKind::Knowledge,
-        };
-
-        let item = Self::new(kind, raw.body.clone()).with_source(Source::External {
-            ref_: raw.source.clone(),
-        });
-
-        let link = SensingLink::new(
-            item.id,
-            SensingTarget::RawItem {
-                id: raw.id.to_string(),
-            },
-            LinkKind::DerivedFrom,
-        );
-
-        (item, link)
     }
 }
 
@@ -397,19 +384,20 @@ impl SensingLink {
 /// The referent of a [`SensingLink`].
 ///
 /// Kept universal so sensemaking primitives are not coupled to any single
-/// downstream layer (Intake, Decisions, TaskAgent, …).
+/// downstream layer (Intake, Decisions, TaskAgent, …). All IDs are opaque
+/// strings so this crate has no compile-time dependency on sibling layers.
+/// mcpbox maps to/from typed IDs when wiring the layer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SensingTarget {
     /// A raw intake item identified by an opaque string (e.g. the RawItem id
-    /// from the Intake layer). String rather than a typed ID so this crate
-    /// has no compile-time dependency on the Intake crate.
+    /// from the Intake layer).
     RawItem { id: String },
     /// A goal or objective in the Decisions layer, identified by an opaque
-    /// string for the same universality reason.
+    /// string.
     Goal { id: String },
-    /// A task in the taskagent tracker.
-    Task { id: TaskId },
+    /// A task in the taskagent tracker (opaque string ID).
+    Task { id: String },
     /// A free-form external reference (URL, document heading, …).
     External { ref_: String },
 }
@@ -494,59 +482,5 @@ mod tests {
         assert!(s.starts_with("si_"), "got: {s}");
         let back: SensingItemId = s.parse().unwrap();
         assert_eq!(id, back);
-    }
-
-    // ── from_raw_item adapter ─────────────────────────────────────────────────
-
-    #[test]
-    fn from_raw_item_records_provenance() {
-        use intake_oss::raw_item::{NewRawItem, RawItemKind};
-
-        let raw = NewRawItem::new("user://alice", RawItemKind::Text, "важная заметка").build();
-        let raw_id_str = raw.id.to_string();
-
-        let (item, link) = SensingItem::from_raw_item(&raw);
-
-        // Родословная: link.source == item.id, link.target == RawItem с тем же id
-        assert_eq!(link.source, item.id);
-        assert_eq!(
-            link.target,
-            SensingTarget::RawItem { id: raw_id_str.clone() },
-            "провенанс должен ссылаться на исходный RawItem"
-        );
-        assert_eq!(link.kind, LinkKind::DerivedFrom);
-
-        // Содержимое передалось
-        assert_eq!(item.body, "важная заметка");
-        assert_eq!(item.kind, SensingItemKind::Knowledge);
-
-        // Из SensingLink можно восстановить id исходного RawItem
-        let recovered_id = match &link.target {
-            SensingTarget::RawItem { id } => id.clone(),
-            other => panic!("ожидался RawItem, получено: {other:?}"),
-        };
-        assert_eq!(recovered_id, raw_id_str);
-    }
-
-    #[test]
-    fn from_raw_item_kind_mapping() {
-        use intake_oss::raw_item::{NewRawItem, RawItemKind};
-
-        let cases = [
-            (RawItemKind::Text, SensingItemKind::Knowledge),
-            (RawItemKind::Document, SensingItemKind::Knowledge),
-            (RawItemKind::Binary, SensingItemKind::Knowledge),
-            (RawItemKind::Reference, SensingItemKind::ResearchGap),
-            (RawItemKind::Event, SensingItemKind::Insight),
-        ];
-
-        for (raw_kind, expected_kind) in cases {
-            let raw = NewRawItem::new("src://test", raw_kind, "body").build();
-            let (item, _link) = SensingItem::from_raw_item(&raw);
-            assert_eq!(
-                item.kind, expected_kind,
-                "RawItemKind::{raw_kind:?} → ожидалось {expected_kind:?}"
-            );
-        }
     }
 }

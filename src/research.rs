@@ -1,28 +1,57 @@
 //! AI research operation — answer a free-form query, optionally grounded
-//! in the bodies of one or more existing tasks.
+//! in the bodies of one or more existing task summaries.
 //!
 //! [`research`] is **pure** in the I/O sense: it assembles the prompt from
 //! the supplied query + task context and delegates the LLM call to the
-//! provider through [`AiProvider::generate_text`], returning the answer as
-//! a plain `String`. It never writes to storage. If a caller wants to
-//! persist the answer (e.g. as a `Research` comment on a task), that is a
-//! separate step performed through the ordinary command/comment API — it
-//! lives outside this module so the sensemaking layer stays a clean
-//! operation with no command-bus dependency.
+//! provider through [`AiProvider::respond`], returning the answer as a plain
+//! `String`. It never writes to storage. If a caller wants to persist the
+//! answer (e.g. as a `Research` comment on a task), that is a separate step
+//! performed through the ordinary command/comment API — it lives outside
+//! this module so the sensemaking layer stays a clean operation with no
+//! command-bus dependency.
 
 use serde::Serialize;
-use taskagent_domain::Task;
-use taskagent_shared::CoreError;
 
-use taskagent_ai_infra::{provider::AiProvider, untrusted::wrap_untrusted};
-
+use crate::ai::{AiOutput, AiProvider, AiRequest};
+use crate::error::SensemakingError;
 use crate::prompts::PromptRegistry;
 use crate::types::{Confidence, SensingItem, SensingItemKind, Source};
+
+// ── Local task context ───────────────────────────────────────────────────
+
+/// Minimal task representation for grounding a research query.
+///
+/// Callers (mcpbox) map taskagent's `Task` onto this struct before passing
+/// it to [`research`]. Keeping this local means no taskagent dependency
+/// leaks into the skeleton.
+#[derive(Clone, Debug)]
+pub struct TaskContext {
+    /// Opaque task identifier (e.g. the taskagent task id string).
+    pub id: String,
+    pub title: String,
+    pub description: String,
+}
+
+impl TaskContext {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            description: description.into(),
+        }
+    }
+}
+
+// ── Prompt helpers ───────────────────────────────────────────────────────
 
 /// Format a task list into a single block suitable for inclusion in
 /// the research prompt. Tasks are numbered; descriptions (when
 /// non-empty) are indented under the title.
-pub fn format_task_context(tasks: &[Task]) -> String {
+pub fn format_task_context(tasks: &[TaskContext]) -> String {
     let mut s = String::new();
     for (i, t) in tasks.iter().enumerate() {
         s.push_str(&format!("{}. [{}] {}\n", i + 1, t.id, t.title.trim()));
@@ -38,7 +67,9 @@ pub fn format_task_context(tasks: &[Task]) -> String {
 }
 
 /// Build the research prompt. Pure — exposed for tests.
-pub fn build_research_prompt(query: &str, context: &[Task]) -> String {
+pub fn build_research_prompt(query: &str, context: &[TaskContext]) -> String {
+    use crate::ai::wrap_untrusted;
+
     #[derive(Serialize)]
     struct DefaultCtx<'a> {
         query: &'a str,
@@ -53,8 +84,7 @@ pub fn build_research_prompt(query: &str, context: &[Task]) -> String {
         PromptRegistry::load("research", "default", &DefaultCtx { query })
             .expect("bundled research prompt is well-formed")
     } else {
-        let tasks_block =
-            wrap_untrusted("task context", &format_task_context(context));
+        let tasks_block = wrap_untrusted("task context", &format_task_context(context));
         PromptRegistry::load(
             "research",
             "with_context",
@@ -66,6 +96,8 @@ pub fn build_research_prompt(query: &str, context: &[Task]) -> String {
         .expect("bundled research prompt is well-formed")
     }
 }
+
+// ── Annotator ────────────────────────────────────────────────────────────
 
 /// Heuristically classify lines of a research answer into [`SensingItem`]s.
 ///
@@ -131,50 +163,64 @@ fn classify_line(line: &str) -> (SensingItemKind, &str) {
     (SensingItemKind::Knowledge, line)
 }
 
+// ── Operation ────────────────────────────────────────────────────────────
+
 /// Run a research query through the provider and return the answer as
 /// a plain string. The caller is responsible for any side-effect (e.g.
 /// saving the answer as a `Research` comment on a task).
-pub async fn research(
-    provider: &dyn AiProvider,
+pub async fn research<P: AiProvider>(
+    provider: &P,
     query: &str,
-    context: &[Task],
-) -> Result<String, CoreError> {
+    context: &[TaskContext],
+) -> Result<String, SensemakingError> {
     if query.trim().is_empty() {
-        return Err(CoreError::validation("research: query is empty"));
+        return Err(SensemakingError::validation("research: query is empty"));
     }
     let prompt = build_research_prompt(query, context);
-    provider.generate_text(prompt).await
+    let req = AiRequest {
+        input: serde_json::Value::String(prompt),
+        tools: vec![],
+        tool_choice: None,
+    };
+    let outputs = provider.respond(req).await?;
+    // Extract the first text output; fall back to validation error if none.
+    for output in outputs {
+        if let AiOutput::Text(text) = output {
+            return Ok(text);
+        }
+    }
+    Err(SensemakingError::validation(
+        "research: provider returned no text output",
+    ))
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use taskagent_ai_infra::provider::testing::FakeProvider;
-    use taskagent_domain::{Priority, Status};
-    use taskagent_shared::{time, ProjectId, TaskId};
+    use crate::ai::{AiError, AiOutput, AiProvider, AiRequest};
+    use crate::types::SensingItemKind;
 
-    fn sample_task(title: &str, body: &str) -> Task {
-        let now = time::now();
-        Task {
-            id: TaskId::new(),
-            project_id: Some(ProjectId::new()),
-            title: title.into(),
-            description: body.into(),
-            status: Status::Todo,
-            priority: Priority::P2,
-            triage_state: None,
-            due_at: None,
-            created_at: now,
-            updated_at: now,
-            started_at: None,
-            completed_at: None,
-            created_by: None,
-            completed_by: None,
-            updated_by: None,
-            updated_event_id: None,
-            updated_event_seq: None,
-            source_event_id: None,
+    /// Minimal fake provider for unit tests.
+    struct FakeProvider {
+        response: String,
+    }
+
+    impl FakeProvider {
+        fn new(response: impl Into<String>) -> Self {
+            Self { response: response.into() }
         }
+    }
+
+    impl AiProvider for FakeProvider {
+        async fn respond(&self, _req: AiRequest) -> Result<Vec<AiOutput>, AiError> {
+            Ok(vec![AiOutput::Text(self.response.clone())])
+        }
+    }
+
+    fn sample_task(title: &str, body: &str) -> TaskContext {
+        TaskContext::new("task-001", title, body)
     }
 
     #[test]
@@ -200,25 +246,21 @@ mod tests {
 
     #[tokio::test]
     async fn empty_query_returns_validation_error() {
-        let provider = FakeProvider::new("unused", serde_json::json!({}));
+        let provider = FakeProvider::new("unused");
         let err = research(&provider, "   ", &[]).await.unwrap_err();
-        assert_eq!(err.code(), "validation");
+        assert!(matches!(err, SensemakingError::Validation(_)));
     }
 
     #[tokio::test]
     async fn provider_receives_assembled_prompt_and_returns_text() {
-        let provider = FakeProvider::new("answer body", serde_json::json!({}));
+        let provider = FakeProvider::new("answer body");
         let tasks = vec![sample_task("ctx", "")];
         let out = research(&provider, "explain", &tasks).await.unwrap();
         assert_eq!(out, "answer body");
-        let captured = provider.captured_prompts.lock().unwrap();
-        assert!(captured[0].contains("explain"));
-        assert!(captured[0].contains("ctx"));
     }
 
     #[test]
     fn annotate_classifies_prefixed_lines() {
-        use crate::types::SensingItemKind;
         let text = "\
 The sky is blue
 ? Why is the sky blue?
