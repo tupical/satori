@@ -9,9 +9,9 @@ license = "Apache-2.0 WITH Commons-Clause"
 path = "src/lib.rs"
 
 [dependencies]
-# Self-contained skeleton: NO taskagent-* and NO sibling *_oss deps.
+# Self-contained skeleton: NO daruma-* and NO sibling *_oss deps.
 # Every primitive / domain / AI type is local. The concrete AI provider
-# and any taskagent adapters are supplied by mcpbox via the `AiProvider`
+# and any daruma adapters are supplied by mcpbox via the `AiProvider`
 # trait — implementations live only inside mcpbox, never here.
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -1,6 +1,6 @@
 //! Local error type.
 //!
-//! Replaces `taskagent_shared::CoreError` so the skeleton is
+//! Replaces `daruma_shared::CoreError` so the skeleton is
 //! dependency-free. mcpbox maps [`SensemakingError`] onto its own error
 //! surface when wiring the layer.
 
