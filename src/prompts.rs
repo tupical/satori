@@ -7,7 +7,7 @@
 //!
 //! ```ignore
 //! use serde::Serialize;
-//! use sensemaking_oss::prompts::PromptRegistry;
+//! use satori::prompts::PromptRegistry;
 //!
 //! #[derive(Serialize)]
 //! struct ResearchCtx<'a> { query: &'a str }

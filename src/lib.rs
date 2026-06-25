@@ -1,4 +1,4 @@
-//! `sensemaking-oss` — the Sensemaking layer skeleton.
+//! `satori` — the Sensemaking layer skeleton.
 //!
 //! A self-contained open-core skeleton: it defines its own primitives,
 //! domain output types, and a provider-neutral [`AiProvider`] seam. It has
