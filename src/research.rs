@@ -21,12 +21,12 @@ use crate::types::{Confidence, SensingItem, SensingItemKind, Source};
 
 /// Minimal task representation for grounding a research query.
 ///
-/// Callers (mcpbox) map taskagent's `Task` onto this struct before passing
-/// it to [`research`]. Keeping this local means no taskagent dependency
+/// Callers (mcpbox) map daruma's `Task` onto this struct before passing
+/// it to [`research`]. Keeping this local means no daruma dependency
 /// leaks into the skeleton.
 #[derive(Clone, Debug)]
 pub struct TaskContext {
-    /// Opaque task identifier (e.g. the taskagent task id string).
+    /// Opaque task identifier (e.g. the daruma task id string).
     pub id: String,
     pub title: String,
     pub description: String,

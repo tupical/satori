@@ -1,9 +1,9 @@
-//! `sensemaking-oss` — the Sensemaking layer skeleton.
+//! `satori` — the Sensemaking layer skeleton.
 //!
 //! A self-contained open-core skeleton: it defines its own primitives,
 //! domain output types, and a provider-neutral [`AiProvider`] seam. It has
-//! **no** dependency on taskagent and **no** dependency on sibling `*_oss`
-//! layers. mcpbox supplies the concrete AI provider and any taskagent
+//! **no** dependency on daruma and **no** dependency on sibling `*_oss`
+//! layers. mcpbox supplies the concrete AI provider and any daruma
 //! adapters when wiring the layer into its architecture — implementations
 //! live only inside mcpbox.
 //!

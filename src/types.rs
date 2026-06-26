@@ -36,8 +36,8 @@ use crate::time::{self, Timestamp};
 
 /// Opaque actor reference — who performed an action.
 ///
-/// Kept as a plain string so this crate has no dependency on taskagent's
-/// domain. mcpbox maps to/from taskagent's `Actor` when wiring the layer.
+/// Kept as a plain string so this crate has no dependency on daruma's
+/// domain. mcpbox maps to/from daruma's `Actor` when wiring the layer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Actor {
     /// Opaque identifier (user-id, agent-id, service name, …).
@@ -190,11 +190,11 @@ impl Default for Confidence {
 /// Intentionally open: a plain string covers non-software contexts (a
 /// journal article, a meeting transcript, a physical experiment result).
 /// Task references use an opaque string ID so this crate has no compile-time
-/// dependency on taskagent. mcpbox maps to/from typed IDs when wiring.
+/// dependency on daruma. mcpbox maps to/from typed IDs when wiring.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
-    /// A task in the taskagent tracker (opaque string ID).
+    /// A task in the daruma tracker (opaque string ID).
     Task { id: String },
     /// A free-form reference (URL, citation, file path, …).
     External { ref_: String },
@@ -365,7 +365,7 @@ pub enum LinkKind {
 
 /// A directed link from a [`SensingItem`] to a [`SensingTarget`].
 ///
-/// `SensingTarget` is intentionally universal: it covers taskagent task
+/// `SensingTarget` is intentionally universal: it covers daruma task
 /// references as well as opaque external references (a Notion goal, a
 /// research objective, a physical project milestone — anything).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -384,7 +384,7 @@ impl SensingLink {
 /// The referent of a [`SensingLink`].
 ///
 /// Kept universal so sensemaking primitives are not coupled to any single
-/// downstream layer (Intake, Decisions, TaskAgent, …). All IDs are opaque
+/// downstream layer (Intake, Decisions, Daruma, …). All IDs are opaque
 /// strings so this crate has no compile-time dependency on sibling layers.
 /// mcpbox maps to/from typed IDs when wiring the layer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -396,7 +396,7 @@ pub enum SensingTarget {
     /// A goal or objective in the Decisions layer, identified by an opaque
     /// string.
     Goal { id: String },
-    /// A task in the taskagent tracker (opaque string ID).
+    /// A task in the daruma tracker (opaque string ID).
     Task { id: String },
     /// A free-form external reference (URL, document heading, …).
     External { ref_: String },
