@@ -21,7 +21,7 @@ use crate::types::{Confidence, SensingItem, SensingItemKind, Source};
 
 /// Minimal task representation for grounding a research query.
 ///
-/// Callers (mcpbox) map daruma's `Task` onto this struct before passing
+/// Callers (the host) map daruma's `Task` onto this struct before passing
 /// it to [`research`]. Keeping this local means no daruma dependency
 /// leaks into the skeleton.
 #[derive(Clone, Debug)]

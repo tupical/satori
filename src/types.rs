@@ -37,7 +37,7 @@ use crate::time::{self, Timestamp};
 /// Opaque actor reference — who performed an action.
 ///
 /// Kept as a plain string so this crate has no dependency on daruma's
-/// domain. mcpbox maps to/from daruma's `Actor` when wiring the layer.
+/// domain. the host maps to/from daruma's `Actor` when wiring the layer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Actor {
     /// Opaque identifier (user-id, agent-id, service name, …).
@@ -190,7 +190,7 @@ impl Default for Confidence {
 /// Intentionally open: a plain string covers non-software contexts (a
 /// journal article, a meeting transcript, a physical experiment result).
 /// Task references use an opaque string ID so this crate has no compile-time
-/// dependency on daruma. mcpbox maps to/from typed IDs when wiring.
+/// dependency on daruma. the host maps to/from typed IDs when wiring.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
@@ -386,7 +386,7 @@ impl SensingLink {
 /// Kept universal so sensemaking primitives are not coupled to any single
 /// downstream layer (Intake, Decisions, Daruma, …). All IDs are opaque
 /// strings so this crate has no compile-time dependency on sibling layers.
-/// mcpbox maps to/from typed IDs when wiring the layer.
+/// the host maps to/from typed IDs when wiring the layer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SensingTarget {

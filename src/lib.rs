@@ -3,13 +3,13 @@
 //! A self-contained open-core skeleton: it defines its own primitives,
 //! domain output types, and a provider-neutral [`AiProvider`] seam. It has
 //! **no** dependency on daruma and **no** dependency on sibling `*_oss`
-//! layers. mcpbox supplies the concrete AI provider and any daruma
+//! layers. the host supplies the concrete AI provider and any daruma
 //! adapters when wiring the layer into its architecture — implementations
-//! live only inside mcpbox.
+//! live only inside the host.
 //!
 //! # Contract
 //! - The sensemaking layer never writes to storage. [`research`] returns
-//!   the answer as a plain `String`; the caller (mcpbox) persists it.
+//!   the answer as a plain `String`; the caller (the host) persists it.
 //! - All JSON is built with [`serde_json::json!`]; no string concatenation.
 //! - Errors propagate as [`SensemakingError`].
 
