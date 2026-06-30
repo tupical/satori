@@ -15,7 +15,9 @@
 
 pub mod ai;
 pub mod error;
+pub mod index;
 pub mod prompts;
+pub mod recall;
 pub mod research;
 pub mod time;
 pub mod types;
@@ -25,7 +27,9 @@ pub use ai::{
     research_answer_tool, wrap_untrusted, AiError, AiOutput, AiProvider, AiRequest, ToolCall,
 };
 pub use error::SensemakingError;
+pub use index::{ImpactGraph, IndexError, IndexHit, SearchIndex};
 pub use prompts::PromptRegistry;
+pub use recall::{impact, lesson_recall, semantic_search, LESSON_PREFIX};
 pub use research::{
     annotate_research_output, build_research_prompt, format_task_context, research, TaskContext,
 };
