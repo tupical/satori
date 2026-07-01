@@ -26,7 +26,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use satori::types::{SensingItem, SensingItemKind};
+use satori::types::{SensingItem, SensingItemKind, Source};
 use serde_json::json;
 
 const TOOL: &str = "satori";
@@ -135,6 +135,10 @@ struct McpRequest {
 struct SenseParams {
     kind: SensingItemKind,
     body: String,
+    /// Optional provenance: the upstream object's id (e.g. a torii RawItem id),
+    /// recorded as the sensing item's source so lineage survives the network hop.
+    #[serde(default)]
+    source_ref: Option<String>,
 }
 
 /// Pure MCP dispatch over the satori sensemaking lib — no auth, no HTTP, so it
@@ -153,7 +157,11 @@ fn dispatch(
                 )
             })?;
             // Real sensemaking: a typed SensingItem with its own id (provenance).
-            let item = SensingItem::new(p.kind, p.body);
+            let mut item = SensingItem::new(p.kind, p.body);
+            if let Some(ref_) = p.source_ref {
+                // Thread upstream lineage across the hop (torii RawItem → here).
+                item.source = Some(Source::External { ref_ });
+            }
             Ok(json!({ "method": "satori.sense", "sensing_item": item }))
         }
         "satori.recall" | "satori.search" => Err((
@@ -175,7 +183,7 @@ mod tests {
     fn sense_builds_typed_sensing_item() {
         let out = dispatch(
             "satori.sense",
-            json!({"kind": "insight", "body": "cache eviction changed the read path"}),
+            json!({"kind": "insight", "body": "cache eviction changed the read path", "source_ref": "raw_abc"}),
         )
         .expect("sense must succeed");
         let item = &out["sensing_item"];
@@ -185,6 +193,9 @@ mod tests {
             item["id"].as_str().is_some(),
             "SensingItem must carry an id (provenance seed)"
         );
+        // Lineage: upstream RawItem id threaded into the sensing item's source.
+        assert_eq!(item["source"]["kind"], "external");
+        assert_eq!(item["source"]["ref_"], "raw_abc");
     }
 
     #[test]
