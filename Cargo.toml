@@ -8,6 +8,13 @@ license = "Apache-2.0 WITH Commons-Clause"
 [lib]
 path = "src/lib.rs"
 
+# `server/` is a thin, independently-deployed HTTP/MCP wrapper around this lib
+# (mirrors the daruma → daruma-server pattern). Boundary-clean: validates a
+# platform-issued signed token via a configured key, never references mcpbox.
+# This makes satori its own deploy unit.
+[workspace]
+members = ["server"]
+
 [dependencies]
 # Self-contained skeleton: NO daruma-* and NO sibling *_oss deps.
 # Every primitive / domain / AI type is local. The concrete AI provider

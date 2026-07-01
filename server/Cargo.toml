@@ -1,0 +1,21 @@
+[package]
+name = "satori-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0 WITH Commons-Clause"
+
+# Thin, independently-deployed HTTP/MCP wrapper around the `satori` lib.
+# Boundary-clean: validates a platform-issued signed token via a configured
+# shared key; never references mcpbox. Its own deploy unit (own systemd service).
+[dependencies]
+satori = { path = ".." }
+axum = "0.7"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "signal"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
