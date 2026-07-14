@@ -70,7 +70,7 @@ async fn main() {
 }
 
 async fn healthz(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({ "service": TOOL, "status": "ok", "version": s.version }))
+    Json(json!({ "service": TOOL, "status": "ok", "version": s.version, "git_sha": option_env!("GIT_SHA").unwrap_or("dev") }))
 }
 
 fn now_secs() -> i64 {
