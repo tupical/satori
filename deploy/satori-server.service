@@ -17,6 +17,8 @@ After=network-online.target
 Environment=SATORI_PORT=8091
 Environment=SATORI_VERSION=0.1.0
 # SATORI_PLATFORM_SECRET (and any future keys) live here, NOT in this unit:
+# OPENAI_API_KEY[/OPENAI_BASE_URL/OPENAI_MODEL] also goes there — without it
+# the AI method `satori.research` answers ai_not_configured (503).
 EnvironmentFile=-%h/.config/satori/satori.env
 ExecStart=%h/.local/bin/satori-server
 Restart=always

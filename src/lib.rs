@@ -16,6 +16,7 @@
 pub mod ai;
 pub mod error;
 pub mod index;
+pub mod profiles;
 pub mod prompts;
 pub mod recall;
 pub mod research;
@@ -28,6 +29,10 @@ pub use ai::{
 };
 pub use error::SensemakingError;
 pub use index::{ImpactGraph, IndexError, IndexHit, SearchIndex};
+pub use profiles::{
+    mine_agent_profiles, AgentProfile, PatternLifecycle, PatternSource, ProfileReport,
+    ResponsibilityPattern, UserSetOverride,
+};
 pub use prompts::PromptRegistry;
 pub use recall::{impact, lesson_recall, semantic_search, LESSON_PREFIX};
 pub use research::{
