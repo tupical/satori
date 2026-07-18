@@ -1,7 +1,7 @@
 //! satori-server — thin, independently-deployed HTTP/MCP wrapper around the
 //! `satori` sensemaking lib. Its own deploy unit (own systemd service, own
-//! port). Boundary-clean: no mcpbox dependency; the platform→tool auth contract
-//! is a configured shared key (see `auth`).
+//! port). Boundary-clean: no mcpbox dependency; the platform→tool auth
+//! contract and the axum/tokio scaffold live in `layer_kit::{auth,serve}`.
 //!
 //! Routes:
 //!   GET  /healthz   — open; liveness + version for the platform registry.
@@ -18,47 +18,52 @@
 //! Env: SATORI_PORT (default 8091), SATORI_PLATFORM_SECRET (HMAC key; if
 //! unset, /v1/mcp is closed), SATORI_VERSION (defaults to the crate version).
 //! AI methods (`satori.research`): OPENAI_API_KEY / OPENAI_BASE_URL /
-//! OPENAI_MODEL (see `ai`); without a key they answer `ai_not_configured`.
-//! Semantic methods: SATORI_SEMANTIC_ENABLED=1 turns the surface on (default
-//! OFF — this is the cost gate; on SaaS the platform makes the same decision
-//! per workspace plan). When off, semantic methods answer `semantic_disabled`
-//! (403). When on they need OPENAI_API_KEY / OPENAI_BASE_URL /
-//! OPENAI_EMBEDDING_MODEL (see `embeddings`); without a key they answer
-//! `embeddings_not_configured` (503). SATORI_SEMANTIC_DIR (default
-//! `data/semantic`) locates the per-workspace sidecar index files.
+//! OPENAI_MODEL (see `layer_kit::openai`); without a key they answer
+//! `ai_not_configured`. Semantic methods: SATORI_SEMANTIC_ENABLED=1 turns
+//! the surface on (default OFF — this is the cost gate; on SaaS the
+//! platform makes the same decision per workspace plan). When off, semantic
+//! methods answer `semantic_disabled` (403). When on they need
+//! OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_EMBEDDING_MODEL (see
+//! `embeddings`); without a key they answer `embeddings_not_configured`
+//! (503). SATORI_SEMANTIC_DIR (default `data/semantic`) locates the
+//! per-workspace sidecar index files.
 
-mod ai;
-mod auth;
 mod embeddings;
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, path::PathBuf};
 
-use axum::{
-    body::Bytes,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
+use axum::http::StatusCode;
+use layer_kit::auth::Claims;
+use layer_kit::openai::{AiConfig, OpenAiProvider};
+use layer_kit::serve::{serve, McpHandler, ServeConfig};
 use satori::types::{SensingItem, SensingItemKind, Source};
 use serde_json::json;
 
 const TOOL: &str = "satori";
 
-struct AppState {
-    version: String,
-    platform_secret: Option<Vec<u8>>,
-    /// Concrete AI provider; `None` when OPENAI_API_KEY is unset — AI methods
-    /// then answer `ai_not_configured` instead of panicking at call time.
-    ai: Option<ai::OpenAiProvider>,
+/// Dispatches satori's MCP methods; owns the AI provider and the semantic
+/// surface's feature flag / embedding provider / per-workspace indexes.
+struct Handler {
+    /// `None` when OPENAI_API_KEY is unset — AI methods then answer
+    /// `ai_not_configured` instead of panicking at call time.
+    ai: Option<OpenAiProvider>,
     /// Semantic surface: feature flag + provider + per-workspace indexes.
     semantic: SemanticState<embeddings::OpenAiEmbeddingProvider>,
+}
+
+impl McpHandler for Handler {
+    async fn dispatch(
+        &self,
+        claims: &Claims,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+        if method.starts_with("satori.semantic_") {
+            dispatch_semantic(&self.semantic, &claims.workspace, method, params).await
+        } else {
+            dispatch(self.ai.as_ref(), method, params).await
+        }
+    }
 }
 
 /// Semantic-surface state. The feature flag and the provider are independent
@@ -79,16 +84,7 @@ struct SemanticState<P> {
 async fn main() {
     tracing_subscriber::fmt().json().init();
 
-    let version =
-        std::env::var("SATORI_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
-    let platform_secret = std::env::var("SATORI_PLATFORM_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(String::into_bytes);
-    if platform_secret.is_none() {
-        tracing::warn!("SATORI_PLATFORM_SECRET unset — /v1/mcp will reject all requests");
-    }
-    let ai = ai::AiConfig::from_env().map(ai::OpenAiProvider::new);
+    let ai = AiConfig::from_env().map(OpenAiProvider::new);
     if ai.is_none() {
         tracing::warn!("OPENAI_API_KEY unset — AI methods (satori.research) will answer ai_not_configured");
     }
@@ -105,96 +101,26 @@ async fn main() {
     let semantic_dir: PathBuf = std::env::var("SATORI_SEMANTIC_DIR")
         .unwrap_or_else(|_| "data/semantic".into())
         .into();
-    let state = Arc::new(AppState {
-        version,
-        platform_secret,
-        ai,
-        semantic: SemanticState {
-            enabled: semantic_enabled,
-            provider: semantic_provider,
-            cfg: satori::SemanticConfig::default(),
-            dir: semantic_dir,
-            indexes: std::sync::Mutex::new(HashMap::new()),
+
+    serve(
+        ServeConfig {
+            tool: TOOL,
+            default_port: 8091,
+            default_version: env!("CARGO_PKG_VERSION"),
+            git_sha: option_env!("GIT_SHA").unwrap_or("dev"),
         },
-    });
-
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/mcp", post(mcp))
-        .with_state(state);
-
-    let port = std::env::var("SATORI_PORT").unwrap_or_else(|_| "8091".to_string());
-    // localhost-bound: only the co-located platform reaches it (C3 hardening).
-    let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
-    tracing::info!(%addr, tool = TOOL, "satori-server listening");
-    axum::serve(listener, app).await.expect("server error");
-}
-
-async fn healthz(State(s): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({ "service": TOOL, "status": "ok", "version": s.version, "git_sha": option_env!("GIT_SHA").unwrap_or("dev") }))
-}
-
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-async fn mcp(State(s): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
-    let Some(secret) = &s.platform_secret else {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"auth_disabled"}))).into_response();
-    };
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
-    let Some(claims) = token.and_then(|t| auth::verify(secret, TOOL, now_secs(), t)) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"invalid_platform_token"})),
-        )
-            .into_response();
-    };
-
-    // Auth passed — dispatch the MCP method against the satori sensemaking lib.
-    let req: McpRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "bad_request", "detail": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-    let result = if req.method.starts_with("satori.semantic_") {
-        dispatch_semantic(&s.semantic, &claims.workspace, &req.method, req.params).await
-    } else {
-        dispatch(s.ai.as_ref(), &req.method, req.params).await
-    };
-    match result {
-        Ok(mut result) => {
-            result["tool"] = json!(TOOL);
-            result["version"] = json!(s.version);
-            result["workspace"] = json!(claims.workspace);
-            result["project"] = json!(claims.project);
-            Json(result).into_response()
-        }
-        Err((code, payload)) => (code, Json(payload)).into_response(),
-    }
-}
-
-/// One MCP call: `{ "method": "satori.sense", "params": { ... } }`.
-#[derive(serde::Deserialize)]
-struct McpRequest {
-    method: String,
-    #[serde(default)]
-    params: serde_json::Value,
+        Handler {
+            ai,
+            semantic: SemanticState {
+                enabled: semantic_enabled,
+                provider: semantic_provider,
+                cfg: satori::SemanticConfig::default(),
+                dir: semantic_dir,
+                indexes: std::sync::Mutex::new(HashMap::new()),
+            },
+        },
+    )
+    .await;
 }
 
 /// Params for `satori.sense`. `kind` deserializes from the lib's snake_case
@@ -526,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn sense_builds_typed_sensing_item() {
         let out = dispatch(
-            None::<&ai::OpenAiProvider>,
+            None::<&OpenAiProvider>,
             "satori.sense",
             json!({"kind": "insight", "body": "cache eviction changed the read path", "source_ref": "raw_abc"}),
         )
@@ -546,11 +472,11 @@ mod tests {
 
     #[tokio::test]
     async fn recall_unsupported_and_unknown_method_rejected() {
-        let (code, _) = dispatch(None::<&ai::OpenAiProvider>, "satori.recall", json!({}))
+        let (code, _) = dispatch(None::<&OpenAiProvider>, "satori.recall", json!({}))
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::NOT_IMPLEMENTED);
-        let (code, _) = dispatch(None::<&ai::OpenAiProvider>, "satori.nope", json!({}))
+        let (code, _) = dispatch(None::<&OpenAiProvider>, "satori.nope", json!({}))
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
@@ -559,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn sense_rejects_bad_params() {
         let (code, _) = dispatch(
-            None::<&ai::OpenAiProvider>,
+            None::<&OpenAiProvider>,
             "satori.sense",
             json!({"body": "no kind"}),
         )
@@ -590,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn research_without_provider_is_honest_503() {
         let (code, body) = dispatch(
-            None::<&ai::OpenAiProvider>,
+            None::<&OpenAiProvider>,
             "satori.research",
             json!({"query": "anything"}),
         )
@@ -627,7 +553,7 @@ mod tests {
         let agent = "11111111-1111-1111-1111-111111111111";
         let unit = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let out = dispatch(
-            None::<&ai::OpenAiProvider>,
+            None::<&OpenAiProvider>,
             "satori.profiles",
             json!({
                 "events": [
@@ -657,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn profiles_rejects_bad_params() {
         let (code, body) = dispatch(
-            None::<&ai::OpenAiProvider>,
+            None::<&OpenAiProvider>,
             "satori.profiles",
             json!({"as_of": "not-a-timestamp"}),
         )

@@ -7,16 +7,19 @@ license = "Apache-2.0 WITH Commons-Clause"
 
 # Thin, independently-deployed HTTP/MCP wrapper around the `satori` lib.
 # Boundary-clean: validates a platform-issued signed token via a configured
-# shared key; never references mcpbox. Its own deploy unit (own systemd service).
+# shared key (layer_kit::auth) and never references mcpbox. The axum/tokio
+# scaffold and the OpenAI client are layer_kit::{serve,openai}; this crate
+# supplies only its own dispatch (+ the satori-specific embeddings client).
+# Its own deploy unit (own systemd service).
 [dependencies]
 satori = { path = ".." }
+layer-kit = { path = "../../layer-kit", features = ["server"] }
 axum = "0.7"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "net", "signal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-hmac = "0.12"
-sha2 = "0.10"
-base64 = "0.22"
+# Needed directly by embeddings.rs (satori-specific: not part of layer-kit's
+# shared openai.rs client).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
