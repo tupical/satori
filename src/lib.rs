@@ -20,6 +20,7 @@ pub mod profiles;
 pub mod prompts;
 pub mod recall;
 pub mod research;
+pub mod semantic;
 pub mod time;
 pub mod types;
 
@@ -37,6 +38,11 @@ pub use prompts::PromptRegistry;
 pub use recall::{impact, lesson_recall, semantic_search, LESSON_PREFIX};
 pub use research::{
     annotate_research_output, build_research_prompt, format_task_context, research, TaskContext,
+};
+pub use semantic::{
+    cosine, hybrid_search, index_nodes, load_sidecar, rerank, save_sidecar, sidecar_path,
+    suggest_links, EmbeddingProvider, FtsCandidate, LinkSuggestion, NodeInput, RankedHit,
+    SemanticConfig, SemanticError, SemanticIndex, SuggestedRelation, EMBED_VERSION,
 };
 pub use time::Timestamp;
 

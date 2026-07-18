@@ -19,6 +19,12 @@ Environment=SATORI_VERSION=0.1.0
 # SATORI_PLATFORM_SECRET (and any future keys) live here, NOT in this unit:
 # OPENAI_API_KEY[/OPENAI_BASE_URL/OPENAI_MODEL] also goes there — without it
 # the AI method `satori.research` answers ai_not_configured (503).
+# Semantic surface (off by default): SATORI_SEMANTIC_ENABLED=1 enables
+# `satori.semantic_index` / `satori.semantic_search` (they reuse OPENAI_API_KEY
+# plus OPENAI_EMBEDDING_MODEL, default text-embedding-3-small; without a key
+# they answer embeddings_not_configured 503, with the flag off — semantic_disabled
+# 403). SATORI_SEMANTIC_DIR overrides the sidecar dir (default ./data/semantic,
+# so set an absolute path like %h/.local/share/satori/semantic for the service).
 EnvironmentFile=-%h/.config/satori/satori.env
 ExecStart=%h/.local/bin/satori-server
 Restart=always

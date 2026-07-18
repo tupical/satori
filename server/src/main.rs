@@ -10,16 +10,30 @@
 //!                     `satori.research` runs the lib's AI research operation,
 //!                     `satori.profiles` process-mines agent profiles from a
 //!                     daruma event stream supplied in the params).
+//!                     Semantic surface (`satori.semantic_index` upserts a node
+//!                     batch into the workspace embedding index,
+//!                     `satori.semantic_search` hybrid-reranks FTS candidates
+//!                     and suggests RelatesTo links).
 //!
 //! Env: SATORI_PORT (default 8091), SATORI_PLATFORM_SECRET (HMAC key; if
 //! unset, /v1/mcp is closed), SATORI_VERSION (defaults to the crate version).
 //! AI methods (`satori.research`): OPENAI_API_KEY / OPENAI_BASE_URL /
 //! OPENAI_MODEL (see `ai`); without a key they answer `ai_not_configured`.
+//! Semantic methods: SATORI_SEMANTIC_ENABLED=1 turns the surface on (default
+//! OFF — this is the cost gate; on SaaS the platform makes the same decision
+//! per workspace plan). When off, semantic methods answer `semantic_disabled`
+//! (403). When on they need OPENAI_API_KEY / OPENAI_BASE_URL /
+//! OPENAI_EMBEDDING_MODEL (see `embeddings`); without a key they answer
+//! `embeddings_not_configured` (503). SATORI_SEMANTIC_DIR (default
+//! `data/semantic`) locates the per-workspace sidecar index files.
 
 mod ai;
 mod auth;
+mod embeddings;
 
 use std::{
+    collections::HashMap,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -43,6 +57,22 @@ struct AppState {
     /// Concrete AI provider; `None` when OPENAI_API_KEY is unset — AI methods
     /// then answer `ai_not_configured` instead of panicking at call time.
     ai: Option<ai::OpenAiProvider>,
+    /// Semantic surface: feature flag + provider + per-workspace indexes.
+    semantic: SemanticState<embeddings::OpenAiEmbeddingProvider>,
+}
+
+/// Semantic-surface state. The feature flag and the provider are independent
+/// gates, checked in order: disabled → 403 `semantic_disabled`; enabled but
+/// unconfigured → 503 `embeddings_not_configured`.
+struct SemanticState<P> {
+    /// SATORI_SEMANTIC_ENABLED == "1". Default off (cost gate).
+    enabled: bool,
+    provider: Option<P>,
+    cfg: satori::SemanticConfig,
+    /// Directory holding one `<workspace>.embeddings.json` sidecar per workspace.
+    dir: PathBuf,
+    /// Loaded workspace indexes (sidecar-backed; written back on upsert).
+    indexes: std::sync::Mutex<HashMap<String, satori::SemanticIndex>>,
 }
 
 #[tokio::main]
@@ -62,10 +92,30 @@ async fn main() {
     if ai.is_none() {
         tracing::warn!("OPENAI_API_KEY unset — AI methods (satori.research) will answer ai_not_configured");
     }
+    let semantic_enabled = std::env::var("SATORI_SEMANTIC_ENABLED")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let semantic_provider =
+        embeddings::EmbeddingConfig::from_env().map(embeddings::OpenAiEmbeddingProvider::new);
+    if !semantic_enabled {
+        tracing::info!("SATORI_SEMANTIC_ENABLED != 1 — semantic methods will answer semantic_disabled");
+    } else if semantic_provider.is_none() {
+        tracing::warn!("semantic enabled but OPENAI_API_KEY unset — semantic methods will answer embeddings_not_configured");
+    }
+    let semantic_dir: PathBuf = std::env::var("SATORI_SEMANTIC_DIR")
+        .unwrap_or_else(|_| "data/semantic".into())
+        .into();
     let state = Arc::new(AppState {
         version,
         platform_secret,
         ai,
+        semantic: SemanticState {
+            enabled: semantic_enabled,
+            provider: semantic_provider,
+            cfg: satori::SemanticConfig::default(),
+            dir: semantic_dir,
+            indexes: std::sync::Mutex::new(HashMap::new()),
+        },
     });
 
     let app = Router::new()
@@ -122,7 +172,12 @@ async fn mcp(State(s): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) ->
                 .into_response();
         }
     };
-    match dispatch(s.ai.as_ref(), &req.method, req.params).await {
+    let result = if req.method.starts_with("satori.semantic_") {
+        dispatch_semantic(&s.semantic, &claims.workspace, &req.method, req.params).await
+    } else {
+        dispatch(s.ai.as_ref(), &req.method, req.params).await
+    };
+    match result {
         Ok(mut result) => {
             result["tool"] = json!(TOOL);
             result["version"] = json!(s.version);
@@ -277,6 +332,173 @@ async fn dispatch<P: satori::AiProvider>(
             StatusCode::NOT_IMPLEMENTED,
             json!({"error": "unsupported", "detail": "satori-server is stateless (OSS skeleton has no index); recall/search need a SearchIndex adapter"}),
         )),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            json!({"error": "unknown_method", "detail": other}),
+        )),
+    }
+}
+
+// ── Semantic surface ────────────────────────────────────────────────────────
+
+/// Params for `satori.semantic_index` — upsert a batch of workspace-graph
+/// nodes (task/plan/document mirrors) into the workspace embedding index.
+#[derive(serde::Deserialize)]
+struct SemanticIndexParams {
+    #[serde(default)]
+    nodes: Vec<satori::NodeInput>,
+}
+
+/// Params for `satori.semantic_search` — hybrid search: the caller's FTS
+/// candidates (with bm25 scores) are reranked against the workspace vector
+/// index; the reply also carries RelatesTo link suggestions.
+#[derive(serde::Deserialize)]
+struct SemanticSearchParams {
+    query: String,
+    /// FTS candidates from the caller's keyword index (may be empty — then
+    /// only suggestions come back).
+    #[serde(default)]
+    fts_candidates: Vec<satori::FtsCandidate>,
+    #[serde(default)]
+    limit: usize,
+    /// Hybrid FTS weight α; defaults to the server's [`satori::SemanticConfig`].
+    alpha: Option<f32>,
+    /// Include RelatesTo suggestions (default true).
+    #[serde(default = "default_suggest")]
+    suggest: bool,
+}
+
+fn default_suggest() -> bool {
+    true
+}
+
+/// Fetch (loading from the sidecar on first touch) a snapshot of the
+/// workspace index. A corrupt / stale sidecar starts the workspace empty —
+/// the honest answer is "reindex", never a panic.
+fn snapshot_index<P: satori::EmbeddingProvider>(
+    sem: &SemanticState<P>,
+    provider: &P,
+    workspace: &str,
+) -> satori::SemanticIndex {
+    let mut indexes = sem.indexes.lock().expect("semantic indexes poisoned");
+    if let Some(index) = indexes.get(workspace) {
+        return index.clone();
+    }
+    let path = satori::sidecar_path(&sem.dir, workspace);
+    let index = match satori::load_sidecar(&path, provider.model()) {
+        Ok(index) => index,
+        Err(e) => {
+            if path.exists() {
+                tracing::warn!(workspace, error = %e, "semantic sidecar unusable — starting empty (reindex required)");
+            }
+            satori::SemanticIndex::new(provider.model())
+        }
+    };
+    indexes.insert(workspace.to_string(), index.clone());
+    index
+}
+
+/// Map a lib [`satori::SemanticError`] onto the wire: caller input problems
+/// → 400, provider/upstream → 502, storage → 500, stale index → 409 (reindex).
+fn semantic_error(e: satori::SemanticError) -> (StatusCode, serde_json::Value) {
+    match e {
+        satori::SemanticError::Validation(m) => (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "validation", "detail": m}),
+        ),
+        satori::SemanticError::Provider(m) => (
+            StatusCode::BAD_GATEWAY,
+            json!({"error": "embedding_upstream", "detail": m}),
+        ),
+        satori::SemanticError::Storage(m) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "semantic_storage", "detail": m}),
+        ),
+        other @ (satori::SemanticError::Version { .. } | satori::SemanticError::ModelMismatch { .. }) => (
+            StatusCode::CONFLICT,
+            json!({"error": "semantic_reindex_required", "detail": other.to_string()}),
+        ),
+    }
+}
+
+/// Semantic MCP dispatch. Gates in order: feature flag (the cost gate —
+/// SaaS platforms enforce the same per-plan) → provider configured → method.
+/// Kept separate from [`dispatch`] (which stays stateless) because the
+/// semantic surface owns per-workspace state.
+async fn dispatch_semantic<P: satori::EmbeddingProvider>(
+    sem: &SemanticState<P>,
+    workspace: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    if !sem.enabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            json!({"error": "semantic_disabled", "detail": "semantic search is gated off; set SATORI_SEMANTIC_ENABLED=1 (on SaaS the platform's per-plan cost gate makes the same decision)"}),
+        ));
+    }
+    let Some(provider) = sem.provider.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "embeddings_not_configured", "detail": "OPENAI_API_KEY not set; satori-server has no embedding provider"}),
+        ));
+    };
+    match method {
+        "satori.semantic_index" => {
+            let p: SemanticIndexParams = serde_json::from_value(params).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "invalid_params", "detail": e.to_string()}),
+                )
+            })?;
+            let mut index = snapshot_index(sem, provider, workspace);
+            let indexed = satori::index_nodes(provider, &mut index, &p.nodes)
+                .await
+                .map_err(semantic_error)?;
+            satori::save_sidecar(&index, &satori::sidecar_path(&sem.dir, workspace))
+                .map_err(semantic_error)?;
+            sem.indexes
+                .lock()
+                .expect("semantic indexes poisoned")
+                .insert(workspace.to_string(), index.clone());
+            Ok(json!({
+                "method": "satori.semantic_index",
+                "indexed": indexed,
+                "total": index.len(),
+                "model": provider.model(),
+            }))
+        }
+        "satori.semantic_search" => {
+            let p: SemanticSearchParams = serde_json::from_value(params).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "invalid_params", "detail": e.to_string()}),
+                )
+            })?;
+            let index = snapshot_index(sem, provider, workspace);
+            let alpha = p.alpha.unwrap_or(sem.cfg.alpha);
+            let results = satori::hybrid_search(
+                provider,
+                &index,
+                &p.query,
+                &p.fts_candidates,
+                alpha,
+                p.limit,
+            )
+            .await
+            .map_err(semantic_error)?;
+            let suggestions = if p.suggest {
+                satori::suggest_links(&index, sem.cfg.suggest_threshold, sem.cfg.suggest_limit)
+            } else {
+                Vec::new()
+            };
+            Ok(json!({
+                "method": "satori.semantic_search",
+                "results": results,
+                "suggestions": suggestions,
+                "alpha": alpha,
+            }))
+        }
         other => Err((
             StatusCode::BAD_REQUEST,
             json!({"error": "unknown_method", "detail": other}),
@@ -443,5 +665,189 @@ mod tests {
         .unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "invalid_params");
+    }
+
+    // ── Semantic surface ─────────────────────────────────────────────────
+
+    /// Deterministic embedding provider: exact-text lookup, zeros fallback.
+    struct FakeEmbed {
+        map: HashMap<String, Vec<f32>>,
+    }
+
+    impl FakeEmbed {
+        fn new(entries: &[(&str, &[f32])]) -> Self {
+            Self {
+                map: entries
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), v.to_vec()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl satori::EmbeddingProvider for FakeEmbed {
+        fn model(&self) -> &str {
+            "fake-embed-v1"
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, satori::SemanticError> {
+            Ok(texts
+                .iter()
+                .map(|t| self.map.get(t).cloned().unwrap_or_else(|| vec![0.0, 0.0]))
+                .collect())
+        }
+    }
+
+    fn semantic_state(
+        enabled: bool,
+        provider: Option<FakeEmbed>,
+    ) -> SemanticState<FakeEmbed> {
+        let dir = std::env::temp_dir().join(format!(
+            "satori-server-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        SemanticState {
+            enabled,
+            provider,
+            cfg: satori::SemanticConfig::default(),
+            dir,
+            indexes: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn fake_provider() -> FakeEmbed {
+        FakeEmbed::new(&[
+            ("Rotate tokens", &[1.0, 0.0]),
+            ("Token rotation policy", &[0.95, 0.05]),
+            ("Billing report", &[0.0, 1.0]),
+            ("token rotation", &[1.0, 0.0]),
+        ])
+    }
+
+    #[tokio::test]
+    async fn semantic_disabled_by_default_is_403() {
+        let sem = semantic_state(false, Some(fake_provider()));
+        let (code, body) = dispatch_semantic(&sem, "ws1", "satori.semantic_search", json!({"query": "x"}))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "semantic_disabled");
+    }
+
+    #[tokio::test]
+    async fn semantic_enabled_without_provider_is_honest_503() {
+        let sem = semantic_state(true, None);
+        let (code, body) = dispatch_semantic(&sem, "ws1", "satori.semantic_index", json!({"nodes": []}))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "embeddings_not_configured");
+    }
+
+    #[tokio::test]
+    async fn semantic_index_then_search_reranks_and_suggests_relates_to() {
+        let sem = semantic_state(true, Some(fake_provider()));
+        let out = dispatch_semantic(
+            &sem,
+            "ws1",
+            "satori.semantic_index",
+            json!({"nodes": [
+                {"id": "task:a", "kind": "task", "title": "Rotate tokens"},
+                {"id": "task:b", "kind": "task", "title": "Token rotation policy"},
+                {"id": "doc:c", "kind": "document", "title": "Billing report"}
+            ]}),
+        )
+        .await
+        .expect("index must succeed");
+        assert_eq!(out["indexed"], 3);
+        assert_eq!(out["total"], 3);
+        assert_eq!(out["model"], "fake-embed-v1");
+        // Sidecar was written for this workspace.
+        assert!(satori::sidecar_path(&sem.dir, "ws1").exists());
+
+        let out = dispatch_semantic(
+            &sem,
+            "ws1",
+            "satori.semantic_search",
+            json!({
+                "query": "token rotation",
+                "fts_candidates": [
+                    {"id": "task:a", "kind": "task", "title": "Rotate tokens", "score": 4.0},
+                    {"id": "task:b", "kind": "task", "title": "Token rotation policy", "score": 8.0},
+                    {"id": "doc:c", "kind": "document", "title": "Billing report", "score": 2.0}
+                ]
+            }),
+        )
+        .await
+        .expect("search must succeed");
+        let results = out["results"].as_array().unwrap();
+        // α = 0.5: b wins (fts 1.0, vec ≈ 0.999), c last (vec 0.0).
+        assert_eq!(results[0]["id"], "task:b");
+        assert_eq!(results[2]["id"], "doc:c");
+        assert!(results[0]["score"].as_f64().unwrap() > results[1]["score"].as_f64().unwrap());
+        // Suggestions: only the close pair, only ever relates_to.
+        let suggestions = out["suggestions"].as_array().unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0]["kind"], "relates_to");
+        assert_eq!(suggestions[0]["from_id"], "task:a");
+        assert_eq!(suggestions[0]["to_id"], "task:b");
+        assert!(suggestions[0]["explanation"].as_str().unwrap().contains("never a blocking dependency"));
+        std::fs::remove_dir_all(&sem.dir).ok();
+    }
+
+    #[tokio::test]
+    async fn semantic_search_rejects_empty_query_and_bad_params() {
+        let sem = semantic_state(true, Some(fake_provider()));
+        let (code, body) = dispatch_semantic(&sem, "ws1", "satori.semantic_search", json!({"query": "  "}))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "validation");
+        let (code, body) = dispatch_semantic(&sem, "ws1", "satori.semantic_search", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_params");
+        let (code, _) = dispatch_semantic(&sem, "ws1", "satori.semantic_nope", json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        std::fs::remove_dir_all(&sem.dir).ok();
+    }
+
+    #[tokio::test]
+    async fn semantic_index_survives_state_restart_via_sidecar() {
+        let dir_state = semantic_state(true, Some(fake_provider()));
+        dispatch_semantic(
+            &dir_state,
+            "ws9",
+            "satori.semantic_index",
+            json!({"nodes": [{"id": "task:a", "kind": "task", "title": "Rotate tokens"}]}),
+        )
+        .await
+        .unwrap();
+        // Fresh state (simulated restart), same dir: the index loads from disk.
+        let restarted = SemanticState {
+            dir: dir_state.dir.clone(),
+            ..semantic_state(true, Some(fake_provider()))
+        };
+        let out = dispatch_semantic(
+            &restarted,
+            "ws9",
+            "satori.semantic_search",
+            json!({
+                "query": "token rotation",
+                "fts_candidates": [{"id": "task:a", "kind": "task", "title": "Rotate tokens", "score": 3.0}]
+            }),
+        )
+        .await
+        .expect("search after restart must succeed");
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results[0]["id"], "task:a");
+        assert_eq!(results[0]["vec_score"], 1.0, "embedding came from the sidecar");
+        std::fs::remove_dir_all(&restarted.dir).ok();
     }
 }
