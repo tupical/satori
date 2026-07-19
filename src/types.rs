@@ -25,10 +25,8 @@
 //! links without depending on task-tracker-specific IDs.
 
 use std::fmt;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::time::{self, Timestamp};
 
@@ -58,59 +56,14 @@ impl Actor {
 
 // ── Strongly-typed ID for sensemaking items ────────────────────────────────
 
-/// Opaque UUIDv7 identifier for a [`SensingItem`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SensingItemId(pub Uuid);
-
-impl SensingItemId {
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
+layer_kit::newtype_id! {
+    /// Opaque UUIDv7 identifier for a [`SensingItem`].
+    pub struct SensingItemId("si");
 }
 
-impl Default for SensingItemId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for SensingItemId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "si_{}", self.0)
-    }
-}
-
-impl FromStr for SensingItemId {
-    type Err = uuid::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let trimmed = s.strip_prefix("si_").unwrap_or(s);
-        Ok(Self(Uuid::parse_str(trimmed)?))
-    }
-}
-
-/// Opaque UUIDv7 identifier for a [`RejectedIdea`].
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RejectedIdeaId(pub Uuid);
-
-impl RejectedIdeaId {
-    pub fn new() -> Self {
-        Self(Uuid::now_v7())
-    }
-}
-
-impl Default for RejectedIdeaId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for RejectedIdeaId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ri_{}", self.0)
-    }
+layer_kit::newtype_id! {
+    /// Opaque UUIDv7 identifier for a [`RejectedIdea`].
+    pub struct RejectedIdeaId("ri");
 }
 
 // ── SensingItemKind ────────────────────────────────────────────────────────
