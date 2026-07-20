@@ -64,6 +64,82 @@ impl McpHandler for Handler {
             dispatch(self.ai.as_ref(), method, params).await
         }
     }
+
+    fn tools(&self) -> Vec<serde_json::Value> {
+        tools()
+    }
+}
+
+/// Tool descriptors for `tools/list` — one per method actually handled by
+/// [`dispatch`] / [`dispatch_semantic`] (`satori.recall`/`satori.search` are
+/// NOT_IMPLEMENTED, so they are omitted).
+fn tools() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "name": "satori_sense",
+            "description": "Build a typed SensingItem from a sensemaking observation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "body": {"type": "string"},
+                    "source_ref": {"type": "string"}
+                },
+                "required": ["kind", "body"]
+            }
+        }),
+        json!({
+            "name": "satori_research",
+            "description": "AI research operation: answer a free-form query, optionally grounded in task context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "context": {"type": "array", "items": {"type": "object"}}
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "satori_profiles",
+            "description": "Process-mine agent capability profiles from a daruma event stream.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "events": {"type": "array", "items": {"type": "object"}},
+                    "user_set_overrides": {"type": "array", "items": {"type": "object"}},
+                    "as_of": {"type": "string"}
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "satori_semantic_index",
+            "description": "Upsert a batch of workspace-graph nodes into the semantic embedding index.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "nodes": {"type": "array", "items": {"type": "object"}}
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "satori_semantic_search",
+            "description": "Hybrid FTS+vector search over the semantic index, with RelatesTo link suggestions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "fts_candidates": {"type": "array", "items": {"type": "object"}},
+                    "limit": {"type": "number"},
+                    "alpha": {"type": "number"},
+                    "suggest": {"type": "boolean"}
+                },
+                "required": ["query"]
+            }
+        }),
+    ]
 }
 
 /// Semantic-surface state. The feature flag and the provider are independent
@@ -578,6 +654,31 @@ mod tests {
         assert_eq!(p["responsibility"][0]["source"], "user_set");
         let conf = p["workflow_confidence"].as_f64().unwrap();
         assert!((0.0..=1.0).contains(&conf));
+    }
+
+    #[tokio::test]
+    async fn tools_list_names_are_all_dispatchable() {
+        let sem = semantic_state(true, Some(fake_provider()));
+        for tool in tools() {
+            let name = tool["name"].as_str().unwrap();
+            let method = name.replacen('_', ".", 1);
+            let body = if method.starts_with("satori.semantic_") {
+                match dispatch_semantic(&sem, "ws1", &method, json!({})).await {
+                    Ok(_) => continue, // e.g. semantic_index with no nodes succeeds trivially
+                    Err((_, body)) => body,
+                }
+            } else {
+                match dispatch(None::<&OpenAiProvider>, &method, json!({})).await {
+                    Ok(_) => continue,
+                    Err((_, body)) => body,
+                }
+            };
+            assert_ne!(
+                body["error"], "unknown_method",
+                "{method} must be a real dispatch method"
+            );
+        }
+        std::fs::remove_dir_all(&sem.dir).ok();
     }
 
     #[tokio::test]
