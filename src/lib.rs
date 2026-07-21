@@ -21,6 +21,7 @@ pub mod prompts;
 pub mod recall;
 pub mod research;
 pub mod semantic;
+pub mod sense;
 pub mod time;
 pub mod types;
 
@@ -44,6 +45,7 @@ pub use semantic::{
     suggest_links, EmbeddingProvider, FtsCandidate, LinkSuggestion, NodeInput, RankedHit,
     SemanticConfig, SemanticError, SemanticIndex, SuggestedRelation, EMBED_VERSION,
 };
+pub use sense::sense_ai;
 pub use time::Timestamp;
 
 // ── Sensemaking type re-exports ──────────────────────────────────────────────

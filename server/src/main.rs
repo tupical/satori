@@ -33,6 +33,7 @@ mod embeddings;
 use std::{collections::HashMap, path::PathBuf};
 
 use axum::http::StatusCode;
+use layer_kit::ai::extract_ai_config;
 use layer_kit::auth::Claims;
 use layer_kit::openai::{AiConfig, OpenAiProvider};
 use layer_kit::serve::{serve, McpHandler, ServeConfig};
@@ -56,10 +57,14 @@ impl McpHandler for Handler {
         &self,
         claims: &Claims,
         method: &str,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
     ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+        let request_ai = extract_ai_config(&mut params);
         if method.starts_with("satori.semantic_") {
             dispatch_semantic(&self.semantic, &claims.workspace, method, params).await
+        } else if let Some(cfg) = request_ai {
+            let provider = OpenAiProvider::new(cfg);
+            dispatch_with_ai(Some(&provider), true, method, params).await
         } else {
             dispatch(self.ai.as_ref(), method, params).await
         }
@@ -162,7 +167,7 @@ async fn main() {
 
     let ai = AiConfig::from_env().map(OpenAiProvider::new);
     if ai.is_none() {
-        tracing::warn!("OPENAI_API_KEY unset — AI methods (satori.research) will answer ai_not_configured");
+        tracing::warn!("OPENAI_API_KEY unset — env-backed AI methods will answer ai_not_configured");
     }
     let semantic_enabled = std::env::var("SATORI_SEMANTIC_ENABLED")
         .map(|v| v == "1")
@@ -170,7 +175,9 @@ async fn main() {
     let semantic_provider =
         embeddings::EmbeddingConfig::from_env().map(embeddings::OpenAiEmbeddingProvider::new);
     if !semantic_enabled {
-        tracing::info!("SATORI_SEMANTIC_ENABLED != 1 — semantic methods will answer semantic_disabled");
+        tracing::info!(
+            "SATORI_SEMANTIC_ENABLED != 1 — semantic methods will answer semantic_disabled"
+        );
     } else if semantic_provider.is_none() {
         tracing::warn!("semantic enabled but OPENAI_API_KEY unset — semantic methods will answer embeddings_not_configured");
     }
@@ -282,6 +289,15 @@ async fn dispatch<P: satori::AiProvider>(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    dispatch_with_ai(ai, false, method, params).await
+}
+
+async fn dispatch_with_ai<P: satori::AiProvider>(
+    ai: Option<&P>,
+    request_ai: bool,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
     match method {
         "satori.sense" => {
             let p: SenseParams = serde_json::from_value(params).map_err(|e| {
@@ -290,8 +306,18 @@ async fn dispatch<P: satori::AiProvider>(
                     json!({"error": "invalid_params", "detail": e.to_string()}),
                 )
             })?;
-            // Real sensemaking: a typed SensingItem with its own id (provenance).
-            let mut item = SensingItem::new(p.kind, p.body);
+            let mut item = if request_ai {
+                let provider = ai.ok_or_else(ai_not_configured)?;
+                satori::sense_ai(provider, &p.body).await.map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": "ai_error", "detail": e.to_string()}),
+                    )
+                })?
+            } else {
+                // Back-compatible deterministic skeleton.
+                SensingItem::new(p.kind, p.body)
+            };
             if let Some(ref_) = p.source_ref {
                 // Thread upstream lineage across the hop (torii RawItem → here).
                 item.source = Some(Source::External { ref_ });
@@ -416,7 +442,8 @@ fn semantic_error(e: satori::SemanticError) -> (StatusCode, serde_json::Value) {
             StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error": "semantic_storage", "detail": m}),
         ),
-        other @ (satori::SemanticError::Version { .. } | satori::SemanticError::ModelMismatch { .. }) => (
+        other @ (satori::SemanticError::Version { .. }
+        | satori::SemanticError::ModelMismatch { .. }) => (
             StatusCode::CONFLICT,
             json!({"error": "semantic_reindex_required", "detail": other.to_string()}),
         ),
@@ -511,7 +538,7 @@ async fn dispatch_semantic<P: satori::EmbeddingProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use satori::{AiError, AiOutput, AiRequest};
+    use satori::{AiError, AiOutput, AiRequest, ToolCall};
 
     /// Fake provider returning a fixed text answer — lets dispatch tests
     /// exercise `satori.research` without network.
@@ -522,6 +549,14 @@ mod tests {
     impl satori::AiProvider for FakeResearch {
         async fn respond(&self, _req: AiRequest) -> Result<Vec<AiOutput>, AiError> {
             Ok(vec![AiOutput::Text(self.text.clone())])
+        }
+    }
+
+    struct FakeSense(Result<Vec<AiOutput>, AiError>);
+
+    impl satori::AiProvider for FakeSense {
+        async fn respond(&self, _req: AiRequest) -> Result<Vec<AiOutput>, AiError> {
+            self.0.clone()
         }
     }
 
@@ -544,6 +579,41 @@ mod tests {
         // Lineage: upstream RawItem id threaded into the sensing item's source.
         assert_eq!(item["source"]["kind"], "external");
         assert_eq!(item["source"]["ref_"], "raw_abc");
+    }
+
+    #[tokio::test]
+    async fn request_ai_senses_without_leaking_secret() {
+        let fake = FakeSense(Ok(vec![AiOutput::ToolCall(ToolCall {
+            name: "sense_material".into(),
+            arguments: r#"{"kind":"risk","confidence":0.9,"summary":"Token expiry is likely."}"#
+                .into(),
+        })]));
+        let mut params = json!({
+            "kind": "knowledge",
+            "body": "long raw material",
+            "ai": {"api_key": "sk-secret", "base_url": "https://ai.test/v1", "model": "test"}
+        });
+        assert!(extract_ai_config(&mut params).is_some());
+        let out = dispatch_with_ai(Some(&fake), true, "satori.sense", params)
+            .await
+            .unwrap();
+        assert_eq!(out["sensing_item"]["kind"], "risk");
+        assert_eq!(out["sensing_item"]["body"], "Token expiry is likely.");
+        assert!(!out.to_string().contains("sk-secret"));
+    }
+
+    #[tokio::test]
+    async fn request_ai_sense_failure_is_ai_error() {
+        let (code, body) = dispatch_with_ai(
+            Some(&FakeSense(Err(AiError::new("boom")))),
+            true,
+            "satori.sense",
+            json!({"kind": "knowledge", "body": "material"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "ai_error");
     }
 
     #[tokio::test]
@@ -724,10 +794,7 @@ mod tests {
         }
     }
 
-    fn semantic_state(
-        enabled: bool,
-        provider: Option<FakeEmbed>,
-    ) -> SemanticState<FakeEmbed> {
+    fn semantic_state(enabled: bool, provider: Option<FakeEmbed>) -> SemanticState<FakeEmbed> {
         let dir = std::env::temp_dir().join(format!(
             "satori-server-test-{}-{}",
             std::process::id(),
@@ -757,9 +824,10 @@ mod tests {
     #[tokio::test]
     async fn semantic_disabled_by_default_is_403() {
         let sem = semantic_state(false, Some(fake_provider()));
-        let (code, body) = dispatch_semantic(&sem, "ws1", "satori.semantic_search", json!({"query": "x"}))
-            .await
-            .unwrap_err();
+        let (code, body) =
+            dispatch_semantic(&sem, "ws1", "satori.semantic_search", json!({"query": "x"}))
+                .await
+                .unwrap_err();
         assert_eq!(code, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "semantic_disabled");
     }
@@ -767,9 +835,10 @@ mod tests {
     #[tokio::test]
     async fn semantic_enabled_without_provider_is_honest_503() {
         let sem = semantic_state(true, None);
-        let (code, body) = dispatch_semantic(&sem, "ws1", "satori.semantic_index", json!({"nodes": []}))
-            .await
-            .unwrap_err();
+        let (code, body) =
+            dispatch_semantic(&sem, "ws1", "satori.semantic_index", json!({"nodes": []}))
+                .await
+                .unwrap_err();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "embeddings_not_configured");
     }
@@ -821,16 +890,24 @@ mod tests {
         assert_eq!(suggestions[0]["kind"], "relates_to");
         assert_eq!(suggestions[0]["from_id"], "task:a");
         assert_eq!(suggestions[0]["to_id"], "task:b");
-        assert!(suggestions[0]["explanation"].as_str().unwrap().contains("never a blocking dependency"));
+        assert!(suggestions[0]["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("never a blocking dependency"));
         std::fs::remove_dir_all(&sem.dir).ok();
     }
 
     #[tokio::test]
     async fn semantic_search_rejects_empty_query_and_bad_params() {
         let sem = semantic_state(true, Some(fake_provider()));
-        let (code, body) = dispatch_semantic(&sem, "ws1", "satori.semantic_search", json!({"query": "  "}))
-            .await
-            .unwrap_err();
+        let (code, body) = dispatch_semantic(
+            &sem,
+            "ws1",
+            "satori.semantic_search",
+            json!({"query": "  "}),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "validation");
         let (code, body) = dispatch_semantic(&sem, "ws1", "satori.semantic_search", json!({}))
@@ -874,7 +951,10 @@ mod tests {
         .expect("search after restart must succeed");
         let results = out["results"].as_array().unwrap();
         assert_eq!(results[0]["id"], "task:a");
-        assert_eq!(results[0]["vec_score"], 1.0, "embedding came from the sidecar");
+        assert_eq!(
+            results[0]["vec_score"], 1.0,
+            "embedding came from the sidecar"
+        );
         std::fs::remove_dir_all(&restarted.dir).ok();
     }
 }
