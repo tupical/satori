@@ -26,7 +26,8 @@ pub mod types;
 
 // ── Seam + operation re-exports ──────────────────────────────────────────────
 pub use ai::{
-    research_answer_tool, wrap_untrusted, AiError, AiOutput, AiProvider, AiRequest, ToolCall,
+    research_answer_tool, wrap_untrusted, AiError, AiOutput, AiProvider, AiRequest, AiUsage,
+    ToolCall,
 };
 pub use error::SensemakingError;
 pub use index::{ImpactGraph, IndexError, IndexHit, SearchIndex};

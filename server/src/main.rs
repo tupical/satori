@@ -66,7 +66,14 @@ impl McpHandler for Handler {
             dispatch_semantic(&self.semantic, &claims.workspace, method, params).await
         } else if let Some(cfg) = request_ai {
             let provider = OpenAiProvider::new(cfg);
-            dispatch_with_ai(&self.store, Some(&provider), true, method, params).await
+            dispatch_with_ai(
+                &self.store,
+                Some(&provider),
+                Some(provider.model()),
+                method,
+                params,
+            )
+            .await
         } else {
             dispatch(&self.store, self.ai.as_ref(), method, params).await
         }
@@ -328,13 +335,13 @@ async fn dispatch<P: satori::AiProvider>(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
-    dispatch_with_ai(store, ai, false, method, params).await
+    dispatch_with_ai(store, ai, None, method, params).await
 }
 
 async fn dispatch_with_ai<P: satori::AiProvider>(
     store: &Store,
     ai: Option<&P>,
-    request_ai: bool,
+    model: Option<&str>,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
@@ -346,14 +353,15 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                     json!({"error": "invalid_params", "detail": e.to_string()}),
                 )
             })?;
-            let mut item = if request_ai {
+            let (mut item, usage) = if let Some(model) = model {
                 let provider = ai.ok_or_else(ai_not_configured)?;
-                satori::sense_ai(provider, &p.body).await.map_err(|e| {
+                let (item, usage) = satori::sense_ai(provider, &p.body).await.map_err(|e| {
                     (
                         StatusCode::BAD_GATEWAY,
                         json!({"error": "ai_error", "detail": e.to_string()}),
                     )
-                })?
+                })?;
+                (item, Some((model, usage)))
             } else {
                 // Back-compatible deterministic skeleton.
                 let kind = satori::sensing_kind_for(&p.kind)
@@ -364,7 +372,7 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                             json!({"error": "invalid_params", "detail": "unknown sensing/raw kind"}),
                         )
                     })?;
-                SensingItem::new(kind, p.body)
+                (SensingItem::new(kind, p.body), None)
             };
             if let Some(ref_) = p.source_ref {
                 // Thread upstream lineage across the hop (torii RawItem → here).
@@ -374,7 +382,15 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                 .put("sensing_item", &item.id.as_uuid().to_string(), &item)
                 .await
                 .map_err(storage_error)?;
-            Ok(json!({ "method": "satori.sense", "sensing_item": item }))
+            let mut out = json!({ "method": "satori.sense", "sensing_item": item });
+            if let Some((model, usage)) = usage {
+                let mut meta = json!({"model": model});
+                if let Some(usage) = usage {
+                    meta["usage"] = json!(usage);
+                }
+                out["_meta"] = meta;
+            }
+            Ok(out)
         }
         "satori.research" => {
             let p: ResearchParams = serde_json::from_value(params).map_err(|e| {
@@ -617,7 +633,7 @@ async fn dispatch_semantic<P: satori::EmbeddingProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use satori::{AiError, AiOutput, AiRequest, ToolCall};
+    use satori::{AiError, AiOutput, AiRequest, AiUsage, ToolCall};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static DB_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -651,7 +667,14 @@ mod tests {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
-        super::dispatch_with_ai(&test_store().await, ai, request_ai, method, params).await
+        super::dispatch_with_ai(
+            &test_store().await,
+            ai,
+            request_ai.then_some("test"),
+            method,
+            params,
+        )
+        .await
     }
 
     /// Fake provider returning a fixed text answer — lets dispatch tests
@@ -671,6 +694,17 @@ mod tests {
     impl satori::AiProvider for FakeSense {
         async fn respond(&self, _req: AiRequest) -> Result<Vec<AiOutput>, AiError> {
             self.0.clone()
+        }
+
+        async fn respond_with_usage(
+            &self,
+            _req: AiRequest,
+        ) -> Result<(Vec<AiOutput>, Option<AiUsage>), AiError> {
+            Ok((self.0.clone()?, Some(AiUsage {
+                input_tokens: Some(123),
+                output_tokens: Some(45),
+                total_tokens: Some(168),
+            })))
         }
     }
 
@@ -693,6 +727,7 @@ mod tests {
         // Lineage: upstream RawItem id threaded into the sensing item's source.
         assert_eq!(item["source"]["kind"], "external");
         assert_eq!(item["source"]["ref_"], "raw_abc");
+        assert!(out.get("_meta").is_none());
     }
 
     #[tokio::test]
@@ -708,11 +743,23 @@ mod tests {
             "ai": {"api_key": "sk-secret", "base_url": "https://ai.test/v1", "model": "test"}
         });
         assert!(extract_ai_config(&mut params).is_some());
-        let out = dispatch_with_ai(Some(&fake), true, "satori.sense", params)
+        let store = test_store().await;
+        let out = super::dispatch_with_ai(
+            &store,
+            Some(&fake),
+            Some("test"),
+            "satori.sense",
+            params,
+        )
             .await
             .unwrap();
         assert_eq!(out["sensing_item"]["kind"], "risk");
         assert_eq!(out["sensing_item"]["body"], "Token expiry is likely.");
+        assert_eq!(out["_meta"]["model"], "test");
+        assert_eq!(out["_meta"]["usage"]["total_tokens"], 168);
+        let id = out["sensing_item"]["id"].as_str().unwrap();
+        let stored: serde_json::Value = store.get("sensing_item", id).await.unwrap().unwrap();
+        assert!(stored.get("_meta").is_none());
         assert!(!out.to_string().contains("sk-secret"));
     }
 

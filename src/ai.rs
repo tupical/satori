@@ -5,7 +5,7 @@
 use serde_json::{json, Value};
 
 pub use layer_kit::ai::{
-    AiError, AiOutput, AiProvider, AiRequest, ToolCall, UNTRUSTED_CLOSE, UNTRUSTED_OPEN,
+    AiError, AiOutput, AiProvider, AiRequest, AiUsage, ToolCall, UNTRUSTED_CLOSE, UNTRUSTED_OPEN,
 };
 pub use layer_kit::ai::wrap_untrusted;
 
