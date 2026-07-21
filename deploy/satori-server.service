@@ -16,6 +16,8 @@ After=network-online.target
 [Service]
 Environment=SATORI_PORT=8091
 Environment=SATORI_VERSION=0.1.0
+# Persistent object/event store, alongside the semantic sidecar directory.
+Environment=SATORI_DB=%h/.local/share/satori/satori.db
 # SATORI_PLATFORM_SECRET (and any future keys) live here, NOT in this unit:
 # OPENAI_API_KEY[/OPENAI_BASE_URL/OPENAI_MODEL] also goes there — without it
 # the AI method `satori.research` answers ai_not_configured (503).
@@ -26,6 +28,7 @@ Environment=SATORI_VERSION=0.1.0
 # 403). SATORI_SEMANTIC_DIR overrides the sidecar dir (default ./data/semantic,
 # so set an absolute path like %h/.local/share/satori/semantic for the service).
 EnvironmentFile=-%h/.config/satori/satori.env
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/satori
 ExecStart=%h/.local/bin/satori-server
 Restart=always
 RestartSec=3

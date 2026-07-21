@@ -8,8 +8,7 @@
 //! live only inside the host.
 //!
 //! # Contract
-//! - The sensemaking layer never writes to storage. [`research`] returns
-//!   the answer as a plain `String`; the caller (the host) persists it.
+//! - Domain primitives stay storage-agnostic; the server persists artifacts.
 //! - All JSON is built with [`serde_json::json!`]; no string concatenation.
 //! - Errors propagate as [`SensemakingError`].
 
@@ -53,3 +52,37 @@ pub use types::{
     Actor, Confidence, LinkKind, ReconsiderTrigger, RejectedIdea, RejectedIdeaId, SensingItem,
     SensingItemId, SensingItemKind, SensingLink, SensingTarget, Source,
 };
+
+/// Map torii's wire-level `RawItemKind` onto the sensing kind owned here.
+pub fn sensing_kind_for(raw_kind: &str) -> Option<SensingItemKind> {
+    Some(match raw_kind {
+        "event" => SensingItemKind::Insight,
+        "text" => SensingItemKind::Hypothesis,
+        "document" | "reference" => SensingItemKind::Knowledge,
+        "binary" => SensingItemKind::ResearchGap,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    #[test]
+    fn raw_kinds_map_to_sensing_kinds() {
+        assert_eq!(sensing_kind_for("event"), Some(SensingItemKind::Insight));
+        assert_eq!(sensing_kind_for("text"), Some(SensingItemKind::Hypothesis));
+        assert_eq!(
+            sensing_kind_for("document"),
+            Some(SensingItemKind::Knowledge)
+        );
+        assert_eq!(
+            sensing_kind_for("reference"),
+            Some(SensingItemKind::Knowledge)
+        );
+        assert_eq!(
+            sensing_kind_for("binary"),
+            Some(SensingItemKind::ResearchGap)
+        );
+    }
+}

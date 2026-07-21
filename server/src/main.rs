@@ -37,7 +37,8 @@ use layer_kit::ai::extract_ai_config;
 use layer_kit::auth::Claims;
 use layer_kit::openai::{AiConfig, OpenAiProvider};
 use layer_kit::serve::{serve, McpHandler, ServeConfig};
-use satori::types::{SensingItem, SensingItemKind, Source};
+use layer_kit::store::Store;
+use satori::types::{SensingItem, Source};
 use serde_json::json;
 
 const TOOL: &str = "satori";
@@ -50,6 +51,7 @@ struct Handler {
     ai: Option<OpenAiProvider>,
     /// Semantic surface: feature flag + provider + per-workspace indexes.
     semantic: SemanticState<embeddings::OpenAiEmbeddingProvider>,
+    store: Store,
 }
 
 impl McpHandler for Handler {
@@ -64,9 +66,9 @@ impl McpHandler for Handler {
             dispatch_semantic(&self.semantic, &claims.workspace, method, params).await
         } else if let Some(cfg) = request_ai {
             let provider = OpenAiProvider::new(cfg);
-            dispatch_with_ai(Some(&provider), true, method, params).await
+            dispatch_with_ai(&self.store, Some(&provider), true, method, params).await
         } else {
-            dispatch(self.ai.as_ref(), method, params).await
+            dispatch(&self.store, self.ai.as_ref(), method, params).await
         }
     }
 
@@ -76,8 +78,7 @@ impl McpHandler for Handler {
 }
 
 /// Tool descriptors for `tools/list` — one per method actually handled by
-/// [`dispatch`] / [`dispatch_semantic`] (`satori.recall`/`satori.search` are
-/// NOT_IMPLEMENTED, so they are omitted).
+/// [`dispatch`] / [`dispatch_semantic`] (`satori.search` remains unsupported).
 fn tools() -> Vec<serde_json::Value> {
     vec![
         json!({
@@ -91,6 +92,17 @@ fn tools() -> Vec<serde_json::Value> {
                     "source_ref": {"type": "string"}
                 },
                 "required": ["kind", "body"]
+            }
+        }),
+        json!({
+            "name": "satori_recall",
+            "description": "Get one persisted SensingItem by id, or list recent items.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1}
+                }
             }
         }),
         json!({
@@ -167,7 +179,9 @@ async fn main() {
 
     let ai = AiConfig::from_env().map(OpenAiProvider::new);
     if ai.is_none() {
-        tracing::warn!("OPENAI_API_KEY unset — env-backed AI methods will answer ai_not_configured");
+        tracing::warn!(
+            "OPENAI_API_KEY unset — env-backed AI methods will answer ai_not_configured"
+        );
     }
     let semantic_enabled = std::env::var("SATORI_SEMANTIC_ENABLED")
         .map(|v| v == "1")
@@ -184,6 +198,10 @@ async fn main() {
     let semantic_dir: PathBuf = std::env::var("SATORI_SEMANTIC_DIR")
         .unwrap_or_else(|_| "data/semantic".into())
         .into();
+    let store = Store::from_env(TOOL).await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to open satori store");
+        std::process::exit(1);
+    });
 
     serve(
         ServeConfig {
@@ -201,6 +219,7 @@ async fn main() {
                 dir: semantic_dir,
                 indexes: std::sync::Mutex::new(HashMap::new()),
             },
+            store,
         },
     )
     .await;
@@ -211,12 +230,31 @@ async fn main() {
 /// `rejected_idea`/`research_gap`).
 #[derive(serde::Deserialize)]
 struct SenseParams {
-    kind: SensingItemKind,
+    kind: String,
     body: String,
     /// Optional provenance: the upstream object's id (e.g. a torii RawItem id),
     /// recorded as the sensing item's source so lineage survives the network hop.
     #[serde(default)]
     source_ref: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RecallParams {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+fn default_limit() -> i64 {
+    100
+}
+
+fn storage_error(e: impl std::fmt::Display) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({"error": "storage_error", "detail": e.to_string()}),
+    )
 }
 
 /// Params for `satori.research` — the lib's AI research operation
@@ -282,17 +320,19 @@ fn ai_error(e: satori::SensemakingError) -> (StatusCode, serde_json::Value) {
 
 /// Pure MCP dispatch over the satori sensemaking lib — no auth, no HTTP, so
 /// it is unit-testable directly (AI methods get a fake `AiProvider` in
-/// tests). `satori` is a stateless OSS skeleton (no index), so
-/// recall/semantic-search (which need a SearchIndex) are unsupported here.
+/// tests). SensingItems use the object store; semantic search keeps its
+/// separate opt-in index.
 async fn dispatch<P: satori::AiProvider>(
+    store: &Store,
     ai: Option<&P>,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
-    dispatch_with_ai(ai, false, method, params).await
+    dispatch_with_ai(store, ai, false, method, params).await
 }
 
 async fn dispatch_with_ai<P: satori::AiProvider>(
+    store: &Store,
     ai: Option<&P>,
     request_ai: bool,
     method: &str,
@@ -316,12 +356,24 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                 })?
             } else {
                 // Back-compatible deterministic skeleton.
-                SensingItem::new(p.kind, p.body)
+                let kind = satori::sensing_kind_for(&p.kind)
+                    .or_else(|| serde_json::from_value(json!(p.kind)).ok())
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            json!({"error": "invalid_params", "detail": "unknown sensing/raw kind"}),
+                        )
+                    })?;
+                SensingItem::new(kind, p.body)
             };
             if let Some(ref_) = p.source_ref {
                 // Thread upstream lineage across the hop (torii RawItem → here).
                 item.source = Some(Source::External { ref_ });
             }
+            store
+                .put("sensing_item", &item.id.as_uuid().to_string(), &item)
+                .await
+                .map_err(storage_error)?;
             Ok(json!({ "method": "satori.sense", "sensing_item": item }))
         }
         "satori.research" => {
@@ -356,9 +408,36 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
             let report = satori::mine_agent_profiles(&p.events, &p.user_set_overrides, p.as_of);
             Ok(json!({ "method": "satori.profiles", "report": report }))
         }
-        "satori.recall" | "satori.search" => Err((
+        "satori.recall" => {
+            let p: RecallParams = serde_json::from_value(params).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "invalid_params", "detail": e.to_string()}),
+                )
+            })?;
+            if let Some(id) = p.id {
+                let item: Option<SensingItem> = store
+                    .get("sensing_item", &id)
+                    .await
+                    .map_err(storage_error)?;
+                return item
+                    .map(|item| json!({"method": "satori.recall", "sensing_item": item}))
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            json!({"error": "not_found", "detail": id}),
+                        )
+                    });
+            }
+            let items: Vec<SensingItem> = store
+                .list("sensing_item", p.limit)
+                .await
+                .map_err(storage_error)?;
+            Ok(json!({"method": "satori.recall", "sensing_items": items}))
+        }
+        "satori.search" => Err((
             StatusCode::NOT_IMPLEMENTED,
-            json!({"error": "unsupported", "detail": "satori-server is stateless (OSS skeleton has no index); recall/search need a SearchIndex adapter"}),
+            json!({"error": "unsupported", "detail": "satori.search needs a SearchIndex adapter"}),
         )),
         other => Err((
             StatusCode::BAD_REQUEST,
@@ -452,7 +531,7 @@ fn semantic_error(e: satori::SemanticError) -> (StatusCode, serde_json::Value) {
 
 /// Semantic MCP dispatch. Gates in order: feature flag (the cost gate —
 /// SaaS platforms enforce the same per-plan) → provider configured → method.
-/// Kept separate from [`dispatch`] (which stays stateless) because the
+/// Kept separate from [`dispatch`] because the
 /// semantic surface owns per-workspace state.
 async fn dispatch_semantic<P: satori::EmbeddingProvider>(
     sem: &SemanticState<P>,
@@ -539,6 +618,41 @@ async fn dispatch_semantic<P: satori::EmbeddingProvider>(
 mod tests {
     use super::*;
     use satori::{AiError, AiOutput, AiRequest, ToolCall};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DB_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    fn db_path() -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "satori-server-{}-{}.db",
+                std::process::id(),
+                DB_SEQ.fetch_add(1, Ordering::Relaxed)
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    async fn test_store() -> Store {
+        Store::open(&db_path()).await.unwrap()
+    }
+
+    async fn dispatch<P: satori::AiProvider>(
+        ai: Option<&P>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+        super::dispatch(&test_store().await, ai, method, params).await
+    }
+
+    async fn dispatch_with_ai<P: satori::AiProvider>(
+        ai: Option<&P>,
+        request_ai: bool,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+        super::dispatch_with_ai(&test_store().await, ai, request_ai, method, params).await
+    }
 
     /// Fake provider returning a fixed text answer — lets dispatch tests
     /// exercise `satori.research` without network.
@@ -617,15 +731,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_unsupported_and_unknown_method_rejected() {
-        let (code, _) = dispatch(None::<&OpenAiProvider>, "satori.recall", json!({}))
+    async fn recall_and_unknown_method_rejected() {
+        let out = dispatch(None::<&OpenAiProvider>, "satori.recall", json!({}))
             .await
-            .unwrap_err();
-        assert_eq!(code, StatusCode::NOT_IMPLEMENTED);
+            .unwrap();
+        assert_eq!(out["sensing_items"], json!([]));
         let (code, _) = dispatch(None::<&OpenAiProvider>, "satori.nope", json!({}))
             .await
             .unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sensing_item_persists_across_restart_and_write_errors_surface() {
+        let path = db_path();
+        let store = Store::open(&path).await.unwrap();
+        let created = super::dispatch(
+            &store,
+            None::<&OpenAiProvider>,
+            "satori.sense",
+            json!({"kind": "event", "body": "persist me", "source_ref": "raw_1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created["sensing_item"]["kind"], "insight");
+        let id = created["sensing_item"]["id"].as_str().unwrap().to_owned();
+        drop(store);
+
+        let reopened = Store::open(&path).await.unwrap();
+        let recalled = super::dispatch(
+            &reopened,
+            None::<&OpenAiProvider>,
+            "satori.recall",
+            json!({"id": id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recalled["sensing_item"]["body"], "persist me");
+
+        reopened.pool().close().await;
+        let (code, body) = super::dispatch(
+            &reopened,
+            None::<&OpenAiProvider>,
+            "satori.sense",
+            json!({"kind": "knowledge", "body": "fail"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "storage_error");
     }
 
     #[tokio::test]
