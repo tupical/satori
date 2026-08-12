@@ -125,6 +125,11 @@ fn tools() -> Vec<serde_json::Value> {
             }
         }),
         json!({
+            "name": "satori_search",
+            "description": "Search sensing items through a host-provided SearchIndex adapter.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
             "name": "satori_profiles",
             "description": "Process-mine agent capability profiles from a daruma event stream.",
             "inputSchema": {
@@ -325,6 +330,16 @@ fn ai_error(e: satori::SensemakingError) -> (StatusCode, serde_json::Value) {
     }
 }
 
+const METHODS: &[&str] = &[
+    "satori.sense",
+    "satori.recall",
+    "satori.research",
+    "satori.search",
+    "satori.profiles",
+    "satori.semantic_index",
+    "satori.semantic_search",
+];
+
 /// Pure MCP dispatch over the satori sensemaking lib — no auth, no HTTP, so
 /// it is unit-testable directly (AI methods get a fake `AiProvider` in
 /// tests). SensingItems use the object store; semantic search keeps its
@@ -345,6 +360,12 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    if !METHODS.contains(&method) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({"error": "unknown_method", "detail": method}),
+        ));
+    }
     match method {
         "satori.sense" => {
             let p: SenseParams = serde_json::from_value(params).map_err(|e| {
@@ -555,6 +576,12 @@ async fn dispatch_semantic<P: satori::EmbeddingProvider>(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    if !METHODS.contains(&method) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({"error": "unknown_method", "detail": method}),
+        ));
+    }
     if !sem.enabled {
         return Err((
             StatusCode::FORBIDDEN,
@@ -950,6 +977,11 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&sem.dir).ok();
+    }
+
+    #[test]
+    fn tools_catalogue_matches_methods() {
+        layer_kit::test_support::assert_catalogue_matches(&tools(), METHODS);
     }
 
     #[tokio::test]
