@@ -4,6 +4,16 @@ name: Rust
 # docs-governance с paths: ["**/*.md", "**/*.mdx"], то есть PR, меняющий
 # только .rs, не запускал ничего: зелёные тесты были зелены лишь локально и
 # лишь если кто-то прогонит их руками.
+#
+# Слой зависит от layer-kit по относительному пути (`path = "../layer-kit"`),
+# поэтому чекаутятся ОБА репозитория рядом: сам слой в подпапку с именем репо,
+# layer-kit — соседней папкой того же workspace. Локально это работало само,
+# потому что рядом лежит рабочая копия; в CI её нет, и первая версия этого
+# workflow падала на `failed to read ../layer-kit/Cargo.toml`.
+#
+# layer-kit приватный, как и слои, поэтому нужен PAT в секрете
+# LAYER_KIT_TOKEN (GITHUB_TOKEN даёт доступ только к своему репозиторию):
+# fine-grained token с правом Contents: Read на tupical/layer-kit.
 on:
   pull_request:
     paths: ["**/*.rs", "Cargo.toml", "Cargo.lock", ".github/workflows/rust.yml"]
@@ -16,16 +26,40 @@ jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
+      # Секрет проверяется через env, а не через `if: secrets.X == ''`:
+      # контекст secrets в step-level `if` недоступен, workflow с ним не
+      # валиден вовсе.
+      - name: Require LAYER_KIT_TOKEN
+        env:
+          LAYER_KIT_TOKEN: ${{ secrets.LAYER_KIT_TOKEN }}
+        run: |
+          if [ -z "$LAYER_KIT_TOKEN" ]; then
+            echo "::error::Нет секрета LAYER_KIT_TOKEN. Слой не собирается без layer-kit, а он в приватном репозитории tupical/layer-kit. Заведите fine-grained PAT с Contents: Read на tupical/layer-kit и добавьте секретом LAYER_KIT_TOKEN."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
+        with:
+          path: satori
+
+      - uses: actions/checkout@v4
+        with:
+          repository: tupical/layer-kit
+          token: ${{ secrets.LAYER_KIT_TOKEN }}
+          path: layer-kit
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: satori
 
       - name: Build
+        working-directory: satori
         run: cargo build --workspace --all-targets
 
       # --no-fail-fast обязателен: без него прогон обрывается на первом
       # красном и выдаёт долю набора за полный.
       - name: Test
+        working-directory: satori
         run: cargo test --workspace --no-fail-fast
