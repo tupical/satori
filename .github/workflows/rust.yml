@@ -12,7 +12,7 @@ name: Rust
 # workflow падала на `failed to read ../layer-kit/Cargo.toml`.
 #
 # layer-kit приватный, как и слои, поэтому нужен PAT в секрете
-# LAYER_KIT_TOKEN (GITHUB_TOKEN даёт доступ только к своему репозиторию):
+# OSS_CHECKOUT_TOKEN (GITHUB_TOKEN даёт доступ только к своему репозиторию):
 # fine-grained token с правом Contents: Read на tupical/layer-kit.
 on:
   pull_request:
@@ -29,12 +29,12 @@ jobs:
       # Секрет проверяется через env, а не через `if: secrets.X == ''`:
       # контекст secrets в step-level `if` недоступен, workflow с ним не
       # валиден вовсе.
-      - name: Require LAYER_KIT_TOKEN
+      - name: Require OSS_CHECKOUT_TOKEN
         env:
-          LAYER_KIT_TOKEN: ${{ secrets.LAYER_KIT_TOKEN }}
+          OSS_CHECKOUT_TOKEN: ${{ secrets.OSS_CHECKOUT_TOKEN }}
         run: |
-          if [ -z "$LAYER_KIT_TOKEN" ]; then
-            echo "::error::Нет секрета LAYER_KIT_TOKEN. Слой не собирается без layer-kit, а он в приватном репозитории tupical/layer-kit. Заведите fine-grained PAT с Contents: Read на tupical/layer-kit и добавьте секретом LAYER_KIT_TOKEN."
+          if [ -z "$OSS_CHECKOUT_TOKEN" ]; then
+            echo "::error::Нет секрета OSS_CHECKOUT_TOKEN. Слой не собирается без layer-kit, а он в приватном репозитории tupical/layer-kit. Заведите fine-grained PAT с Contents: Read на tupical/layer-kit и добавьте секретом OSS_CHECKOUT_TOKEN."
             exit 1
           fi
 
@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: tupical/layer-kit
-          token: ${{ secrets.LAYER_KIT_TOKEN }}
+          token: ${{ secrets.OSS_CHECKOUT_TOKEN }}
           path: layer-kit
 
       - uses: dtolnay/rust-toolchain@stable
