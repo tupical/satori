@@ -6,8 +6,8 @@
 //! Routes:
 //!   GET  /healthz   — open; liveness + version for the platform registry.
 //!   POST /v1/mcp    — requires a valid platform token; sensemaking surface
-//!                     (`satori.sense` builds a typed SensingItem via the lib,
-//!                     `satori.research` runs the lib's AI research operation,
+//!                     (`satori.sense` and `satori.research` run the lib's AI
+//!                     sensemaking operations,
 //!                     `satori.profiles` process-mines agent profiles from a
 //!                     daruma event stream supplied in the params).
 //!                     Semantic surface (`satori.semantic_index` upserts a node
@@ -17,7 +17,7 @@
 //!
 //! Env: SATORI_PORT (default 8091), SATORI_PLATFORM_SECRET (HMAC key; if
 //! unset, /v1/mcp is closed), SATORI_VERSION (defaults to the crate version).
-//! AI methods (`satori.research`): OPENAI_API_KEY / OPENAI_BASE_URL /
+//! AI methods (`satori.sense`, `satori.research`): OPENAI_API_KEY / OPENAI_BASE_URL /
 //! OPENAI_MODEL (see `layer_kit::openai`); without a key they answer
 //! `ai_not_configured`. Semantic methods: SATORI_SEMANTIC_ENABLED=1 turns
 //! the surface on (default OFF — this is the cost gate; on SaaS the
@@ -68,14 +68,21 @@ impl McpHandler for Handler {
             let provider = OpenAiProvider::new(cfg);
             dispatch_with_ai(
                 &self.store,
-                Some(&provider),
-                Some(provider.model()),
+                Some((&provider, provider.model())),
                 method,
                 params,
             )
             .await
         } else {
-            dispatch(&self.store, self.ai.as_ref(), method, params).await
+            dispatch_with_ai(
+                &self.store,
+                self.ai
+                    .as_ref()
+                    .map(|provider| (provider, provider.model())),
+                method,
+                params,
+            )
+            .await
         }
     }
 
@@ -85,20 +92,19 @@ impl McpHandler for Handler {
 }
 
 /// Tool descriptors for `tools/list` — one per method actually handled by
-/// [`dispatch`] / [`dispatch_semantic`] (`satori.search` remains unsupported).
+/// [`dispatch_with_ai`] / [`dispatch_semantic`] (`satori.search` remains unsupported).
 fn tools() -> Vec<serde_json::Value> {
     vec![
         json!({
             "name": "satori_sense",
-            "description": "Build a typed SensingItem from a sensemaking observation.",
+            "description": "AI sensemaking: build a typed SensingItem from raw material.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string"},
                     "body": {"type": "string"},
                     "source_ref": {"type": "string"}
                 },
-                "required": ["kind", "body"]
+                "required": ["body"]
             }
         }),
         json!({
@@ -237,12 +243,12 @@ async fn main() {
     .await;
 }
 
-/// Params for `satori.sense`. `kind` deserializes from the lib's snake_case
-/// enum (`knowledge`/`question`/`hypothesis`/`risk`/`contradiction`/`insight`/
-/// `rejected_idea`/`research_gap`).
+/// Params for `satori.sense`.
+// No deny_unknown_fields: платформа всё ещё шлёт теперь игнорируемый `kind`
+// (mcpbox-pipeline transition::raw_to_sense). Добавлять его сюда нельзя, пока
+// transition не перестанет его слать.
 #[derive(serde::Deserialize)]
 struct SenseParams {
-    kind: String,
     body: String,
     /// Optional provenance: the upstream object's id (e.g. a torii RawItem id),
     /// recorded as the sensing item's source so lineage survives the network hop.
@@ -340,23 +346,9 @@ const METHODS: &[&str] = &[
     "satori.semantic_search",
 ];
 
-/// Pure MCP dispatch over the satori sensemaking lib — no auth, no HTTP, so
-/// it is unit-testable directly (AI methods get a fake `AiProvider` in
-/// tests). SensingItems use the object store; semantic search keeps its
-/// separate opt-in index.
-async fn dispatch<P: satori::AiProvider>(
-    store: &Store,
-    ai: Option<&P>,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
-    dispatch_with_ai(store, ai, None, method, params).await
-}
-
 async fn dispatch_with_ai<P: satori::AiProvider>(
     store: &Store,
-    ai: Option<&P>,
-    model: Option<&str>,
+    ai: Option<(&P, &str)>,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
@@ -374,27 +366,19 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                     json!({"error": "invalid_params", "detail": e.to_string()}),
                 )
             })?;
-            let (mut item, usage) = if let Some(model) = model {
-                let provider = ai.ok_or_else(ai_not_configured)?;
-                let (item, usage) = satori::sense_ai(provider, &p.body).await.map_err(|e| {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        json!({"error": "ai_error", "detail": e.to_string()}),
-                    )
-                })?;
-                (item, Some((model, usage)))
-            } else {
-                // Back-compatible deterministic skeleton.
-                let kind = satori::sensing_kind_for(&p.kind)
-                    .or_else(|| serde_json::from_value(json!(p.kind)).ok())
-                    .ok_or_else(|| {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            json!({"error": "invalid_params", "detail": "unknown sensing/raw kind"}),
-                        )
-                    })?;
-                (SensingItem::new(kind, p.body), None)
-            };
+            if p.body.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "invalid_params", "detail": "body must be non-empty"}),
+                ));
+            }
+            let (provider, model) = ai.ok_or_else(ai_not_configured)?;
+            let (mut item, usage) = satori::sense_ai(provider, &p.body).await.map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": "ai_error", "detail": e.to_string()}),
+                )
+            })?;
             if let Some(ref_) = p.source_ref {
                 // Thread upstream lineage across the hop (torii RawItem → here).
                 item.source = Some(Source::External { ref_ });
@@ -404,13 +388,11 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                 .await
                 .map_err(storage_error)?;
             let mut out = json!({ "method": "satori.sense", "sensing_item": item });
-            if let Some((model, usage)) = usage {
-                let mut meta = json!({"model": model});
-                if let Some(usage) = usage {
-                    meta["usage"] = json!(usage);
-                }
-                out["_meta"] = meta;
+            let mut meta = json!({"model": model});
+            if let Some(usage) = usage {
+                meta["usage"] = json!(usage);
             }
+            out["_meta"] = meta;
             Ok(out)
         }
         "satori.research" => {
@@ -420,9 +402,7 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                     json!({"error": "invalid_params", "detail": e.to_string()}),
                 )
             })?;
-            let Some(provider) = ai else {
-                return Err(ai_not_configured());
-            };
+            let (provider, _) = ai.ok_or_else(ai_not_configured)?;
             let context: Vec<satori::TaskContext> = p
                 .context
                 .into_iter()
@@ -685,19 +665,9 @@ mod tests {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
-        super::dispatch(&test_store().await, ai, method, params).await
-    }
-
-    async fn dispatch_with_ai<P: satori::AiProvider>(
-        ai: Option<&P>,
-        request_ai: bool,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
         super::dispatch_with_ai(
             &test_store().await,
-            ai,
-            request_ai.then_some("test"),
+            ai.map(|provider| (provider, "test")),
             method,
             params,
         )
@@ -718,6 +688,13 @@ mod tests {
 
     struct FakeSense(Result<Vec<AiOutput>, AiError>);
 
+    fn successful_sense(kind: &str, summary: &str) -> FakeSense {
+        FakeSense(Ok(vec![AiOutput::ToolCall(ToolCall {
+            name: "sense_material".into(),
+            arguments: json!({"kind": kind, "confidence": 0.9, "summary": summary}).to_string(),
+        })]))
+    }
+
     impl satori::AiProvider for FakeSense {
         async fn respond(&self, _req: AiRequest) -> Result<Vec<AiOutput>, AiError> {
             self.0.clone()
@@ -727,20 +704,24 @@ mod tests {
             &self,
             _req: AiRequest,
         ) -> Result<(Vec<AiOutput>, Option<AiUsage>), AiError> {
-            Ok((self.0.clone()?, Some(AiUsage {
-                input_tokens: Some(123),
-                output_tokens: Some(45),
-                total_tokens: Some(168),
-            })))
+            Ok((
+                self.0.clone()?,
+                Some(AiUsage {
+                    input_tokens: Some(123),
+                    output_tokens: Some(45),
+                    total_tokens: Some(168),
+                }),
+            ))
         }
     }
 
     #[tokio::test]
     async fn sense_builds_typed_sensing_item() {
+        let fake = successful_sense("insight", "cache eviction changed the read path");
         let out = dispatch(
-            None::<&OpenAiProvider>,
+            Some(&fake),
             "satori.sense",
-            json!({"kind": "insight", "body": "cache eviction changed the read path", "source_ref": "raw_abc"}),
+            json!({"body": "raw material", "source_ref": "raw_abc"}),
         )
         .await
         .expect("sense must succeed");
@@ -754,32 +735,22 @@ mod tests {
         // Lineage: upstream RawItem id threaded into the sensing item's source.
         assert_eq!(item["source"]["kind"], "external");
         assert_eq!(item["source"]["ref_"], "raw_abc");
-        assert!(out.get("_meta").is_none());
+        assert_eq!(out["_meta"]["model"], "test");
     }
 
     #[tokio::test]
     async fn request_ai_senses_without_leaking_secret() {
-        let fake = FakeSense(Ok(vec![AiOutput::ToolCall(ToolCall {
-            name: "sense_material".into(),
-            arguments: r#"{"kind":"risk","confidence":0.9,"summary":"Token expiry is likely."}"#
-                .into(),
-        })]));
+        let fake = successful_sense("risk", "Token expiry is likely.");
         let mut params = json!({
-            "kind": "knowledge",
+            "kind": "insight",
             "body": "long raw material",
             "ai": {"api_key": "sk-secret", "base_url": "https://ai.test/v1", "model": "test"}
         });
         assert!(extract_ai_config(&mut params).is_some());
         let store = test_store().await;
-        let out = super::dispatch_with_ai(
-            &store,
-            Some(&fake),
-            Some("test"),
-            "satori.sense",
-            params,
-        )
+        let out = super::dispatch_with_ai(&store, Some((&fake, "test")), "satori.sense", params)
             .await
-            .unwrap();
+            .expect("satori.sense must accept transition's ignored kind field");
         assert_eq!(out["sensing_item"]["kind"], "risk");
         assert_eq!(out["sensing_item"]["body"], "Token expiry is likely.");
         assert_eq!(out["_meta"]["model"], "test");
@@ -792,11 +763,10 @@ mod tests {
 
     #[tokio::test]
     async fn request_ai_sense_failure_is_ai_error() {
-        let (code, body) = dispatch_with_ai(
+        let (code, body) = dispatch(
             Some(&FakeSense(Err(AiError::new("boom")))),
-            true,
             "satori.sense",
-            json!({"kind": "knowledge", "body": "material"}),
+            json!({"body": "material"}),
         )
         .await
         .unwrap_err();
@@ -820,11 +790,12 @@ mod tests {
     async fn sensing_item_persists_across_restart_and_write_errors_surface() {
         let path = db_path();
         let store = Store::open(&path).await.unwrap();
-        let created = super::dispatch(
+        let fake = successful_sense("insight", "persist me");
+        let created = super::dispatch_with_ai(
             &store,
-            None::<&OpenAiProvider>,
+            Some((&fake, "test")),
             "satori.sense",
-            json!({"kind": "event", "body": "persist me", "source_ref": "raw_1"}),
+            json!({"body": "raw material", "source_ref": "raw_1"}),
         )
         .await
         .unwrap();
@@ -833,9 +804,9 @@ mod tests {
         drop(store);
 
         let reopened = Store::open(&path).await.unwrap();
-        let recalled = super::dispatch(
+        let recalled = super::dispatch_with_ai(
             &reopened,
-            None::<&OpenAiProvider>,
+            None::<(&OpenAiProvider, &str)>,
             "satori.recall",
             json!({"id": id}),
         )
@@ -844,11 +815,11 @@ mod tests {
         assert_eq!(recalled["sensing_item"]["body"], "persist me");
 
         reopened.pool().close().await;
-        let (code, body) = super::dispatch(
+        let (code, body) = super::dispatch_with_ai(
             &reopened,
-            None::<&OpenAiProvider>,
+            Some((&fake, "test")),
             "satori.sense",
-            json!({"kind": "knowledge", "body": "fail"}),
+            json!({"body": "fail"}),
         )
         .await
         .unwrap_err();
@@ -858,14 +829,38 @@ mod tests {
 
     #[tokio::test]
     async fn sense_rejects_bad_params() {
-        let (code, _) = dispatch(
-            None::<&OpenAiProvider>,
+        for params in [json!({}), json!({"body": "   "})] {
+            let (code, body) = dispatch(None::<&OpenAiProvider>, "satori.sense", params)
+                .await
+                .unwrap_err();
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"], "invalid_params");
+        }
+    }
+
+    #[tokio::test]
+    async fn sense_without_provider_is_503_and_does_not_persist() {
+        let store = test_store().await;
+        let (code, body) = super::dispatch_with_ai(
+            &store,
+            None::<(&OpenAiProvider, &str)>,
             "satori.sense",
-            json!({"body": "no kind"}),
+            json!({"body": "do not persist"}),
         )
         .await
         .unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "ai_not_configured");
+
+        let listed = super::dispatch_with_ai(
+            &store,
+            None::<(&OpenAiProvider, &str)>,
+            "satori.recall",
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed["sensing_items"], json!([]));
     }
 
     #[tokio::test]
