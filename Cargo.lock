@@ -845,7 +845,6 @@ dependencies = [
 [[package]]
 name = "layer-kit"
 version = "0.2.0"
-source = "git+https://github.com/tupical/layer-kit#ac58bb398c101121003734631bad6c6a75dc263e"
 dependencies = [
  "axum",
  "base64",
