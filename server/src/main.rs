@@ -244,9 +244,6 @@ async fn main() {
 }
 
 /// Params for `satori.sense`.
-// No deny_unknown_fields: платформа всё ещё шлёт теперь игнорируемый `kind`
-// (mcpbox-pipeline transition::raw_to_sense). Добавлять его сюда нельзя, пока
-// transition не перестанет его слать.
 #[derive(serde::Deserialize)]
 struct SenseParams {
     body: String,
@@ -750,7 +747,7 @@ mod tests {
         let store = test_store().await;
         let out = super::dispatch_with_ai(&store, Some((&fake, "test")), "satori.sense", params)
             .await
-            .expect("satori.sense must accept transition's ignored kind field");
+            .expect("satori.sense must tolerate unknown input fields");
         assert_eq!(out["sensing_item"]["kind"], "risk");
         assert_eq!(out["sensing_item"]["body"], "Token expiry is likely.");
         assert_eq!(out["_meta"]["model"], "test");
