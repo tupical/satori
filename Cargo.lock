@@ -1457,7 +1457,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "layer-kit",
- "reqwest",
  "satori",
  "serde",
  "serde_json",
