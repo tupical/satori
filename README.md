@@ -26,19 +26,20 @@ torii · <b>satori</b> · enma · yatagarasu · fujin · daruma
 Satori is the **sensemaking** layer of the Meisei pipeline: it turns raw intake
 material into understanding. It owns `SensingItem` primitives (with confidence,
 sources, links and reconsider triggers), AI sensemaking operations (`sense`,
-`research` with task-context annotation), process-mining of agent responsibility
-patterns (`profiles`) from a daruma event stream. Domain
+`research` with task-context annotation). Domain
 primitives stay storage-agnostic; the server persists artifacts. The crate has no
 dependency on daruma or sibling layers; adapters live only inside the host.
 
 The unused embedding index/provider and semantic MCP methods were removed.
 Existing sidecar files are left untouched; old semantic environment flags have
-no effect. WorkspaceGraph FTS remains in Daruma.
+no effect. WorkspaceGraph FTS, lesson recall, downstream impact and capability profiles
+are implemented in Daruma. Unwired search/impact adapters and the duplicate
+profile miner were removed from Satori. `satori.recall` only reads persisted
+SensingItems for the cabinet; it is not Daruma lesson recall.
 
 ## Repository layout
 
-- `src/` — the `satori` library: sensing types, `research`, `profiles`, recall,
-  prompt registry, error types.
+- `src/` — the `satori` library: sensing types, `research`, prompt registry, error types.
 - `server/` — `satori-server`, a thin, independently-deployed HTTP/MCP wrapper over
   the library (the axum/tokio scaffold comes from `layer-kit`).
 - `deploy/` — release `build.sh` (stamps the git SHA into `/healthz`) and a
@@ -51,7 +52,6 @@ cargo run -p satori-server
 # GET  /healthz   — open liveness/version probe
 # POST /v1/mcp    — platform-token gated MCP surface:
 #                   satori.sense, satori.recall, satori.research,
-#                   satori.profiles
 ```
 
 For production builds use `deploy/build.sh` so `/healthz` reports the real git SHA

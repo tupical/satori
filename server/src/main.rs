@@ -7,9 +7,7 @@
 //!   GET  /healthz   — open; liveness + version for the platform registry.
 //!   POST /v1/mcp    — requires a valid platform token; sensemaking surface
 //!                     (`satori.sense` and `satori.research` run the lib's AI
-//!                     sensemaking operations,
-//!                     `satori.profiles` process-mines agent profiles from a
-//!                     daruma event stream supplied in the params).
+//!                     sensemaking operations).
 //!
 //! Env: SATORI_PORT (default 8091), SATORI_PLATFORM_SECRET (HMAC key; if
 //! unset, /v1/mcp is closed), SATORI_VERSION (defaults to the crate version).
@@ -72,7 +70,7 @@ impl McpHandler for Handler {
 }
 
 /// Tool descriptors for `tools/list` — one per method actually handled by
-/// [`dispatch_with_ai`] (`satori.search` remains unsupported).
+/// [`dispatch_with_ai`].
 fn tools() -> Vec<serde_json::Value> {
     vec![
         json!({
@@ -108,24 +106,6 @@ fn tools() -> Vec<serde_json::Value> {
                     "context": {"type": "array", "items": {"type": "object"}}
                 },
                 "required": ["query"]
-            }
-        }),
-        json!({
-            "name": "satori_search",
-            "description": "Search sensing items through a host-provided SearchIndex adapter.",
-            "inputSchema": {"type": "object", "properties": {}}
-        }),
-        json!({
-            "name": "satori_profiles",
-            "description": "Process-mine agent capability profiles from a daruma event stream.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "events": {"type": "array", "items": {"type": "object"}},
-                    "user_set_overrides": {"type": "array", "items": {"type": "object"}},
-                    "as_of": {"type": "string"}
-                },
-                "required": []
             }
         }),
     ]
@@ -207,24 +187,6 @@ struct ResearchTaskInput {
     description: String,
 }
 
-/// Params for `satori.profiles` — the lib's process-mining operation
-/// ([`profiles`](satori::profiles)): fold a daruma event stream (envelope
-/// JSON, log order) into per-agent profiles. Stateless: every input arrives
-/// in the params, nothing is stored server-side.
-#[derive(serde::Deserialize)]
-struct ProfilesParams {
-    /// `daruma_events::EventEnvelope` JSON values (bare payloads accepted).
-    #[serde(default)]
-    events: Vec<serde_json::Value>,
-    /// Human capability overrides from the daruma core
-    /// (`agent_capability_profiles` rows with `source = 'user_set'`).
-    #[serde(default)]
-    user_set_overrides: Vec<satori::UserSetOverride>,
-    /// Optional RFC3339 horizon closing still-open blocked intervals.
-    #[serde(default)]
-    as_of: Option<satori::Timestamp>,
-}
-
 /// Error when no AI provider is configured: an honest 503, not a panic.
 fn ai_not_configured() -> (StatusCode, serde_json::Value) {
     (
@@ -248,13 +210,7 @@ fn ai_error(e: satori::SensemakingError) -> (StatusCode, serde_json::Value) {
     }
 }
 
-const METHODS: &[&str] = &[
-    "satori.sense",
-    "satori.recall",
-    "satori.research",
-    "satori.search",
-    "satori.profiles",
-];
+const METHODS: &[&str] = &["satori.sense", "satori.recall", "satori.research"];
 
 async fn dispatch_with_ai<P: satori::AiProvider>(
     store: &Store,
@@ -324,17 +280,6 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                 .map_err(ai_error)?;
             Ok(json!({ "method": "satori.research", "answer": answer }))
         }
-        "satori.profiles" => {
-            let p: ProfilesParams = serde_json::from_value(params).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    json!({"error": "invalid_params", "detail": e.to_string()}),
-                )
-            })?;
-            // Pure lib call: events → profiles, no server state involved.
-            let report = satori::mine_agent_profiles(&p.events, &p.user_set_overrides, p.as_of);
-            Ok(json!({ "method": "satori.profiles", "report": report }))
-        }
         "satori.recall" => {
             let p: RecallParams = serde_json::from_value(params).map_err(|e| {
                 (
@@ -362,10 +307,6 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                 .map_err(storage_error)?;
             Ok(json!({"method": "satori.recall", "sensing_items": items}))
         }
-        "satori.search" => Err((
-            StatusCode::NOT_IMPLEMENTED,
-            json!({"error": "unsupported", "detail": "satori.search needs a SearchIndex adapter"}),
-        )),
         other => Err((
             StatusCode::BAD_REQUEST,
             json!({"error": "unknown_method", "detail": other}),
@@ -656,38 +597,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profiles_mines_event_stream() {
-        let agent = "11111111-1111-1111-1111-111111111111";
-        let unit = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let out = dispatch(
-            None::<&OpenAiProvider>,
-            "satori.profiles",
-            json!({
-                "events": [
-                    { "type": "work_unit_created", "work_unit": { "id": unit, "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "capability_tags": ["frontend"] } },
-                    { "type": "work_unit_claimed", "work_unit_id": unit, "agent_id": agent },
-                    { "type": "work_unit_completed", "work_unit_id": unit, "completed_by": agent, "elapsed_ms": 5000 }
-                ],
-                "user_set_overrides": [{ "agent_id": agent, "capability": "frontend", "score": 0.9 }]
-            }),
-        )
-        .await
-        .expect("profiles must succeed");
-        assert_eq!(out["method"], "satori.profiles");
-        let report = &out["report"];
-        assert_eq!(report["envelopes_parsed"], 3);
-        let p = &report["agents"][0];
-        assert_eq!(p["agent_id"], agent);
-        assert_eq!(p["completed_units"], 1);
-        assert_eq!(p["mean_cycle_ms"], 5000.0);
-        // The human override promotes the mined pattern to active.
-        assert_eq!(p["responsibility"][0]["lifecycle"], "active");
-        assert_eq!(p["responsibility"][0]["source"], "user_set");
-        let conf = p["workflow_confidence"].as_f64().unwrap();
-        assert!((0.0..=1.0).contains(&conf));
-    }
-
-    #[tokio::test]
     async fn tools_list_names_are_all_dispatchable() {
         for tool in tools() {
             let name = tool["name"].as_str().unwrap();
@@ -710,15 +619,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profiles_rejects_bad_params() {
-        let (code, body) = dispatch(
-            None::<&OpenAiProvider>,
+    async fn removed_prototypes_are_not_advertised_or_dispatched() {
+        for method in [
+            "satori.search",
             "satori.profiles",
-            json!({"as_of": "not-a-timestamp"}),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(code, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "invalid_params");
+            "satori.semantic_index",
+            "satori.semantic_search",
+        ] {
+            let name = method.replacen('.', "_", 1);
+            assert!(!tools().iter().any(|tool| tool["name"] == name));
+            let (status, body) = dispatch(None::<&OpenAiProvider>, method, json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"], "unknown_method");
+        }
     }
 }
