@@ -37,23 +37,21 @@ struct Handler {
 impl McpHandler for Handler {
     async fn dispatch(
         &self,
-        _claims: &Claims,
+        claims: &Claims,
         method: &str,
         mut params: serde_json::Value,
     ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+        // One store serves every tenant: confine this call to the token's scope.
+        let store = &self
+            .store
+            .scoped(&claims.workspace, claims.project.as_deref());
         let request_ai = extract_ai_config(&mut params);
         if let Some(cfg) = request_ai {
             let provider = OpenAiProvider::new(cfg);
-            dispatch_with_ai(
-                &self.store,
-                Some((&provider, provider.model())),
-                method,
-                params,
-            )
-            .await
+            dispatch_with_ai(store, Some((&provider, provider.model())), method, params).await
         } else {
             dispatch_with_ai(
-                &self.store,
+                store,
                 self.ai
                     .as_ref()
                     .map(|provider| (provider, provider.model())),
@@ -634,5 +632,44 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(body["error"], "unknown_method");
         }
+    }
+
+    /// daruma 01a0d3bc: one layer server serves every tenant — the platform
+    /// token's workspace confines every read, so ws B never sees ws A's objects.
+    #[tokio::test]
+    async fn token_of_one_workspace_never_sees_another() {
+        let claims = |ws: &str| Claims {
+            workspace: ws.into(),
+            project: None,
+            tool: TOOL.into(),
+            exp: i64::MAX,
+        };
+        let store = test_store().await;
+        let fake = successful_sense("insight", "secret of A");
+        let out = super::dispatch_with_ai(
+            &store.scoped("ws_a", None),
+            Some((&fake, "test")),
+            "satori.sense",
+            json!({"body": "raw", "source_ref": "raw_a"}),
+        )
+        .await
+        .unwrap();
+        let id = out["sensing_item"]["id"].as_str().unwrap().to_owned();
+        let handler = Handler { ai: None, store };
+        let b = handler
+            .dispatch(&claims("ws_b"), "satori.recall", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(b["sensing_items"], json!([]));
+        let (code, _) = handler
+            .dispatch(&claims("ws_b"), "satori.recall", json!({"id": id}))
+            .await
+            .unwrap_err();
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        let a = handler
+            .dispatch(&claims("ws_a"), "satori.recall", json!({"id": id}))
+            .await
+            .unwrap();
+        assert_eq!(a["sensing_item"]["body"], "secret of A");
     }
 }
