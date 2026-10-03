@@ -11,16 +11,57 @@ struct SenseResult {
     kind: SensingItemKind,
     confidence: f32,
     summary: String,
+    #[serde(default)]
+    open_questions: Vec<String>,
+}
+
+/// Deterministic (no-LLM) scan for an "open questions" section: the lines
+/// following a heading like `Open questions:` / `## Открытые вопросы` up to
+/// the next heading or blank line after the list. Bullets/numbering are stripped.
+pub fn extract_open_questions(material: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in material.lines() {
+        let t = line.trim();
+        let head = t
+            .trim_start_matches('#')
+            .trim()
+            .trim_end_matches(':')
+            .to_lowercase();
+        if head == "open questions" || head == "открытые вопросы" {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if t.is_empty() {
+            if !out.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if t.starts_with('#') {
+            break;
+        }
+        let q = t
+            .trim_start_matches(|c: char| "-*•0123456789.) ".contains(c))
+            .trim();
+        if !q.is_empty() {
+            out.push(q.to_string());
+        }
+    }
+    out
 }
 
 /// Classify and summarize raw material into the existing sensing artifact.
 pub async fn sense_ai<P: AiProvider>(
     provider: &P,
     material: &str,
-) -> Result<(SensingItem, Option<AiUsage>), SensemakingError> {
+) -> Result<(SensingItem, Vec<String>, Option<AiUsage>), SensemakingError> {
     let req = AiRequest {
         input: Value::String(format!(
-            "Classify the material and return a concise factual summary.\n{}",
+            "Classify the material and return a concise factual summary. List any open questions the material leaves unanswered in open_questions.\n{}",
             wrap_untrusted("material", material)
         )),
         tools: vec![json!({
@@ -32,9 +73,10 @@ pub async fn sense_ai<P: AiProvider>(
                 "properties": {
                     "kind": {"type": "string", "enum": ["knowledge", "question", "hypothesis", "risk", "contradiction", "insight", "rejected_idea", "research_gap"]},
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "summary": {"type": "string"}
+                    "summary": {"type": "string"},
+                    "open_questions": {"type": "array", "items": {"type": "string"}}
                 },
-                "required": ["kind", "confidence", "summary"],
+                "required": ["kind", "confidence", "summary", "open_questions"],
                 "additionalProperties": false
             }
         })],
@@ -58,6 +100,7 @@ pub async fn sense_ai<P: AiProvider>(
     Ok((
         SensingItem::new(result.kind, result.summary)
             .with_confidence(Confidence::new(result.confidence)),
+        result.open_questions,
         usage,
     ))
 }
@@ -81,10 +124,17 @@ mod tests {
             name: "sense_material".into(),
             arguments: r#"{"kind":"risk","confidence":0.8,"summary":"Token may expire."}"#.into(),
         })]));
-        let (item, _) = sense_ai(&fake, "long material").await.unwrap();
+        let (item, _, _) = sense_ai(&fake, "long material").await.unwrap();
         assert_eq!(item.kind, SensingItemKind::Risk);
         assert_eq!(item.body, "Token may expire.");
         assert_eq!(item.confidence.value(), 0.8);
+    }
+
+    #[test]
+    fn extracts_open_questions_section() {
+        let m = "Intro\n\n## Открытые вопросы\n- Кто владелец?\n2. Какой срок?\n\nДальше текст";
+        assert_eq!(extract_open_questions(m), ["Кто владелец?", "Какой срок?"]);
+        assert!(extract_open_questions("no questions here").is_empty());
     }
 
     #[tokio::test]

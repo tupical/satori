@@ -208,6 +208,14 @@ fn ai_error(e: satori::SensemakingError) -> (StatusCode, serde_json::Value) {
     }
 }
 
+/// 422: the material has open questions a human must answer; nothing is persisted.
+fn needs_input(questions: Vec<String>) -> (StatusCode, serde_json::Value) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({"error": "needs_input", "questions": questions}),
+    )
+}
+
 const METHODS: &[&str] = &["satori.sense", "satori.recall", "satori.research"];
 
 async fn dispatch_with_ai<P: satori::AiProvider>(
@@ -236,13 +244,35 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
                     json!({"error": "invalid_params", "detail": "body must be non-empty"}),
                 ));
             }
-            let (provider, model) = ai.ok_or_else(ai_not_configured)?;
-            let (mut item, usage) = satori::sense_ai(provider, &p.body).await.map_err(|e| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    json!({"error": "ai_error", "detail": e.to_string()}),
-                )
-            })?;
+            // Deterministic gate first: works with no AI provider.
+            let mut questions = satori::extract_open_questions(&p.body);
+            let (provider, model) = match ai {
+                Some(ai) => ai,
+                None if !questions.is_empty() => return Err(needs_input(questions)),
+                None => return Err(ai_not_configured()),
+            };
+            let (mut item, ai_questions, usage) =
+                satori::sense_ai(provider, &p.body).await.map_err(|e| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": "ai_error", "detail": e.to_string()}),
+                    )
+                })?;
+            for q in ai_questions {
+                if !questions.contains(&q) {
+                    questions.push(q);
+                }
+            }
+            if matches!(
+                item.kind,
+                satori::SensingItemKind::Question | satori::SensingItemKind::ResearchGap
+            ) && questions.is_empty()
+            {
+                questions.push(item.body.clone());
+            }
+            if !questions.is_empty() {
+                return Err(needs_input(questions));
+            }
             if let Some(ref_) = p.source_ref {
                 // Thread upstream lineage across the hop (torii RawItem → here).
                 item.source = Some(Source::External { ref_ });
@@ -276,7 +306,14 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
             let answer = satori::research(provider, &p.query, &context)
                 .await
                 .map_err(ai_error)?;
-            Ok(json!({ "method": "satori.research", "answer": answer }))
+            let items = satori::annotate_research_output(&answer, Some(p.query.clone()));
+            for item in &items {
+                store
+                    .put("sensing_item", &item.id.as_uuid().to_string(), item)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            Ok(json!({ "method": "satori.research", "answer": answer, "sensing_items": items }))
         }
         "satori.recall" => {
             let p: RecallParams = serde_json::from_value(params).map_err(|e| {
@@ -390,6 +427,33 @@ mod tests {
                 }),
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn sense_open_questions_stop_run_without_provider() {
+        let err = dispatch::<FakeSense>(
+            None,
+            "satori.sense",
+            json!({"body": "Plan.\n\nОткрытые вопросы:\n- Кто платит?\n"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.1["error"], "needs_input");
+        assert_eq!(err.1["questions"][0], "Кто платит?");
+    }
+
+    #[tokio::test]
+    async fn sense_ai_open_questions_stop_run() {
+        let fake = FakeSense(Ok(vec![AiOutput::ToolCall(ToolCall {
+            name: "sense_material".into(),
+            arguments: json!({"kind":"insight","confidence":0.9,"summary":"s","open_questions":["Какой срок?"]}).to_string(),
+        })]));
+        let err = dispatch(Some(&fake), "satori.sense", json!({"body": "material"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.1["questions"][0], "Какой срок?");
     }
 
     #[tokio::test]
@@ -570,6 +634,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "ai_not_configured");
+    }
+
+    #[tokio::test]
+    async fn research_returns_typed_question_items() {
+        let fake = FakeResearch {
+            text: "? who owns rotation\nplain fact".into(),
+        };
+        let out = dispatch(Some(&fake), "satori.research", json!({"query": "rotate?"}))
+            .await
+            .unwrap();
+        assert_eq!(out["sensing_items"][0]["kind"], "question");
+        assert_eq!(out["sensing_items"][1]["kind"], "knowledge");
     }
 
     #[tokio::test]

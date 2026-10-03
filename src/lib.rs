@@ -30,7 +30,7 @@ pub use prompts::PromptRegistry;
 pub use research::{
     annotate_research_output, build_research_prompt, format_task_context, research, TaskContext,
 };
-pub use sense::sense_ai;
+pub use sense::{extract_open_questions, sense_ai};
 pub use time::Timestamp;
 
 // ── Sensemaking type re-exports ──────────────────────────────────────────────
