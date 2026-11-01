@@ -70,9 +70,33 @@ instead of `"dev"`.
 | `SATORI_PLATFORM_SECRET` | unset | HMAC key; if unset, `/v1/mcp` is closed |
 | `SATORI_VERSION` | crate version | Version reported by `/healthz` |
 | `SATORI_DB` | `./satori.db` | SQLite store path (`layer_kit::store::Store`) |
-| `OPENAI_API_KEY` | unset | Optional AI provider for `satori.sense` / `satori.research`; without a key they answer `ai_not_configured` (503) |
+| `OPENAI_API_KEY` | unset | Optional AI provider for `satori.sense` / `satori.research`; without a key they fail with `ai_not_configured` (see [Errors over MCP](#errors-over-mcp)) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL of the OpenAI-compatible API |
 | `OPENAI_MODEL` | `gpt-4.1` | Model used by the AI operations |
+
+## Errors over MCP
+
+`POST /v1/mcp` speaks MCP (JSON-RPC 2.0) only. A tool that fails is a tool
+result, not an HTTP error: `tools/call` answers HTTP 200 with
+`result.isError: true`, the error object in `result.structuredContent`
+(`error` is the machine-readable code) and the same JSON as text in
+`result.content[0].text`. The status a method carries internally — e.g. 503
+for `ai_not_configured` — never reaches the wire. Calling `satori_sense`
+without an AI provider returns:
+
+```json
+{"jsonrpc": "2.0", "id": 1, "result": {
+  "content": [{"type": "text", "text": "{\"detail\":\"…\",\"error\":\"ai_not_configured\"}"}],
+  "structuredContent": {"detail": "OPENAI_API_KEY not set; satori-server has no AI provider", "error": "ai_not_configured"},
+  "isError": true}}
+```
+
+Protocol faults are JSON-RPC `error` objects, also with HTTP 200 (`-32601`
+unknown method, `-32602` `tools/call` without `name`). HTTP status codes are
+reserved for the transport: 401 for a missing or invalid platform token or a
+closed surface (`auth_disabled`), 400 for a body that is not a JSON-RPC 2.0
+request, 202 with an empty body for a notification. The envelope is
+implemented once in `layer-kit` (`src/serve.rs`).
 
 ## Docs
 

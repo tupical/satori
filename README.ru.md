@@ -60,9 +60,33 @@ cargo run -p satori-server
 | `SATORI_PLATFORM_SECRET` | не задан | HMAC-ключ; если не задан, `/v1/mcp` закрыт |
 | `SATORI_VERSION` | версия крейта | Версия, отдаваемая `/healthz` |
 | `SATORI_DB` | `./satori.db` | Путь к SQLite-хранилищу (`layer_kit::store::Store`) |
-| `OPENAI_API_KEY` | не задан | Опциональный AI-провайдер для `satori.sense` / `satori.research`; без ключа — ответ `ai_not_configured` (503) |
+| `OPENAI_API_KEY` | не задан | Опциональный AI-провайдер для `satori.sense` / `satori.research`; без ключа — ошибка `ai_not_configured` (см. [Ошибки через MCP](#ошибки-через-mcp)) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Базовый URL OpenAI-совместимого API |
 | `OPENAI_MODEL` | `gpt-4.1` | Модель, используемая AI-операциями |
+
+## Ошибки через MCP
+
+`POST /v1/mcp` принимает только MCP (JSON-RPC 2.0). Упавший инструмент — это
+результат инструмента, а не HTTP-ошибка: `tools/call` отвечает HTTP 200 с
+`result.isError: true`, объектом ошибки в `result.structuredContent` (поле
+`error` — машиночитаемый код) и тем же JSON текстом в
+`result.content[0].text`. Внутренний статус метода — например, 503 у
+`ai_not_configured` — на провод не попадает. Вызов `satori_sense` без
+AI-провайдера возвращает:
+
+```json
+{"jsonrpc": "2.0", "id": 1, "result": {
+  "content": [{"type": "text", "text": "{\"detail\":\"…\",\"error\":\"ai_not_configured\"}"}],
+  "structuredContent": {"detail": "OPENAI_API_KEY not set; satori-server has no AI provider", "error": "ai_not_configured"},
+  "isError": true}}
+```
+
+Сбои протокола — объекты JSON-RPC `error`, тоже с HTTP 200 (`-32601` —
+неизвестный метод, `-32602` — `tools/call` без `name`). HTTP-коды остаются за
+транспортом: 401 — нет или неверный платформенный токен либо поверхность
+закрыта (`auth_disabled`), 400 — тело не является запросом JSON-RPC 2.0,
+202 с пустым телом — notification. Конверт реализован один раз в
+`layer-kit` (`src/serve.rs`).
 
 ## Документация
 
