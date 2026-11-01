@@ -61,7 +61,8 @@ cargo run -p satori-server
 | `SATORI_VERSION` | версия крейта | Версия, отдаваемая `/healthz` |
 | `SATORI_DB` | `./satori.db` | Путь к SQLite-хранилищу (`layer_kit::store::Store`) |
 | `OPENAI_API_KEY` | не задан | Опциональный AI-провайдер для `satori.sense` / `satori.research`; без ключа — ошибка `ai_not_configured` (см. [Ошибки через MCP](#ошибки-через-mcp)) |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Базовый URL OpenAI-совместимого API |
+| `OPENAI_API_PROTOCOL` | `responses` | Протокол: `responses`, `chat_completions` или `anthropic_messages` (Claude, `POST /v1/messages` с `x-api-key`); неизвестное значение отключает AI. Платформа может вместо этого прислать request-scoped блок `ai` с тем же `api_protocol` |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` (`https://api.anthropic.com` для `anthropic_messages`) | Базовый URL API провайдера |
 | `OPENAI_MODEL` | `gpt-4.1` | Модель, используемая AI-операциями |
 
 ## Ошибки через MCP

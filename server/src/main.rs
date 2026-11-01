@@ -361,6 +361,9 @@ async fn dispatch_with_ai<P: satori::AiProvider>(
 // ── Semantic surface ────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod anthropic_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use satori::{AiError, AiOutput, AiRequest, AiUsage, ToolCall};

@@ -5,7 +5,7 @@ intent: "reference"
 owner: "MeiSei"
 status: "active"
 source_of_truth: "README.md"
-last_verified: "2026-10-28"
+last_verified: "2026-11-01"
 ---
 
 # Satori 悟り — sensemaking layer of Meisei
@@ -71,7 +71,8 @@ instead of `"dev"`.
 | `SATORI_VERSION` | crate version | Version reported by `/healthz` |
 | `SATORI_DB` | `./satori.db` | SQLite store path (`layer_kit::store::Store`) |
 | `OPENAI_API_KEY` | unset | Optional AI provider for `satori.sense` / `satori.research`; without a key they fail with `ai_not_configured` (see [Errors over MCP](#errors-over-mcp)) |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL of the OpenAI-compatible API |
+| `OPENAI_API_PROTOCOL` | `responses` | Wire protocol: `responses`, `chat_completions` or `anthropic_messages` (Claude, `POST /v1/messages` with `x-api-key`); an unknown value disables AI. The platform may instead send a request-scoped `ai` block with the same `api_protocol` |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` (`https://api.anthropic.com` for `anthropic_messages`) | Base URL of the provider API |
 | `OPENAI_MODEL` | `gpt-4.1` | Model used by the AI operations |
 
 ## Errors over MCP
