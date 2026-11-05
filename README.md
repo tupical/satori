@@ -5,7 +5,7 @@ intent: "reference"
 owner: "MeiSei"
 status: "active"
 source_of_truth: "README.md"
-last_verified: "2026-11-01"
+last_verified: "2026-11-04"
 ---
 
 # Satori 悟り — sensemaking layer of Meisei
@@ -95,9 +95,13 @@ without an AI provider returns:
 Protocol faults are JSON-RPC `error` objects, also with HTTP 200 (`-32601`
 unknown method, `-32602` `tools/call` without `name`). HTTP status codes are
 reserved for the transport: 401 for a missing or invalid platform token or a
-closed surface (`auth_disabled`), 400 for a body that is not a JSON-RPC 2.0
-request, 202 with an empty body for a notification. The envelope is
-implemented once in `layer-kit` (`src/serve.rs`).
+closed surface (`auth_disabled`), 400 with `{"error":"bad_request","detail":"…"}`
+for a body that is not a JSON-RPC 2.0 request, 202 with an empty body for a
+notification. A body is a JSON-RPC 2.0 request only if it is valid JSON and its
+`jsonrpc` member is exactly the string `"2.0"`: a missing member, another
+version or another type gets the 400, notifications included, and never reaches
+the layer. The token is checked first, so without a valid one the answer is
+401. The envelope is implemented once in `layer-kit` (`src/serve.rs`).
 
 ## Docs
 
